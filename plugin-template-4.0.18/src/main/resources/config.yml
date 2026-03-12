@@ -1,0 +1,15 @@
+permission-node: customitems.admin
+use-permission-node: customitems.use
+send-ability-messages: true
+default-cooldown-ms: 1250
+max-vein-size: 96
+default-break-radius: 0
+default-item-vacuum-radius: 6
+mob-detection-radius: 22
+sell-container:
+  fallback-worth:
+    COBBLESTONE: 0.2
+    COAL: 1.5
+    IRON_INGOT: 4.0
+    GOLD_INGOT: 7.0
+    DIAMOND: 20.0

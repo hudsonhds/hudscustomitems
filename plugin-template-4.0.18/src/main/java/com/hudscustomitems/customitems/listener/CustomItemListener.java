@@ -1,0 +1,1219 @@
+package com.hudscustomitems.customitems.listener;
+
+import com.hudscustomitems.customitems.service.CustomItemService;
+import com.hudscustomitems.customitems.service.SellContainerService;
+import com.hudscustomitems.customitems.service.SellContainerService.SellOutcome;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.Location;
+import org.bukkit.Material;
+import org.bukkit.Particle;
+import org.bukkit.Sound;
+import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
+import org.bukkit.block.data.Ageable;
+import org.bukkit.entity.AbstractArrow;
+import org.bukkit.entity.Entity;
+import org.bukkit.entity.EntityType;
+import org.bukkit.entity.ExperienceOrb;
+import org.bukkit.entity.Item;
+import org.bukkit.entity.LivingEntity;
+import org.bukkit.entity.Player;
+import org.bukkit.entity.Projectile;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
+import org.bukkit.event.block.Action;
+import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockDropItemEvent;
+import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.player.PlayerDropItemEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerToggleFlightEvent;
+import org.bukkit.event.player.PlayerToggleSneakEvent;
+import org.bukkit.inventory.CookingRecipe;
+import org.bukkit.inventory.EquipmentSlot;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.Recipe;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
+import org.bukkit.util.RayTraceResult;
+import org.bukkit.util.Vector;
+
+/**
+ * Handles gameplay behavior tied to custom item attributes.
+ */
+public final class CustomItemListener implements Listener {
+  private final JavaPlugin plugin;
+  private final CustomItemService itemService;
+  private final SellContainerService sellContainerService;
+  private final LegacyComponentSerializer serializer;
+  private final Set<String> breakGuard;
+  private final Set<UUID> combatEffectGuard;
+  private final Map<UUID, Integer> comboHits;
+  private final Map<UUID, Long> movementThrottle;
+
+  /**
+   * Creates listener with references needed for custom item runtime logic.
+   *
+   * @param plugin owner plugin
+   * @param itemService item service
+   * @param sellContainerService sell container service
+   */
+  public CustomItemListener(
+      JavaPlugin plugin,
+      CustomItemService itemService,
+      SellContainerService sellContainerService) {
+    this.plugin = plugin;
+    this.itemService = itemService;
+    this.sellContainerService = sellContainerService;
+    this.serializer = LegacyComponentSerializer.legacyAmpersand();
+    this.breakGuard = new HashSet<>();
+    this.combatEffectGuard = new HashSet<>();
+    this.comboHits = new HashMap<>();
+    this.movementThrottle = new HashMap<>();
+  }
+
+  /**
+   * Runs once-per-second effects such as buffs, particles and durability/energy regen.
+   */
+  public void runSecondTick() {
+    for (Player player : Bukkit.getOnlinePlayers()) {
+      itemService.synchronizeInventory(player);
+      ItemStack held = player.getInventory().getItemInMainHand();
+      if (itemService.customItemId(held).isEmpty()) {
+        continue;
+      }
+      Map<String, String> attributes = itemService.resolveAttributes(held);
+      applyPotionBuffs(player, attributes);
+      applyTrailParticles(player, attributes);
+      applyBlockHighlighting(player, attributes);
+      applyMobDetection(player, attributes);
+      itemService.tickRegen(player);
+      updateDoubleJumpState(player, attributes);
+      animateLoreIfNeeded(held, attributes);
+    }
+  }
+
+  @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+  public void onBlockBreak(BlockBreakEvent event) {
+    Player player = event.getPlayer();
+    ItemStack held = player.getInventory().getItemInMainHand();
+    if (itemService.customItemId(held).isEmpty()) {
+      return;
+    }
+    Map<String, String> attributes = itemService.resolveAttributes(held);
+    if (!itemService.canUse(player, held, null, true)) {
+      event.setCancelled(true);
+      return;
+    }
+    if (isUnbreakableBlock(event.getBlock().getType())) {
+      event.setCancelled(true);
+      player.sendMessage(color("&cThat block cannot be broken by custom item abilities."));
+      return;
+    }
+    if (!passesBlockLists(event.getBlock(), attributes)) {
+      event.setCancelled(true);
+      player.sendMessage(color("&cThis block is not allowed for this item."));
+      return;
+    }
+    String locationKey = locationKey(event.getBlock().getLocation());
+    if (breakGuard.contains(locationKey)) {
+      return;
+    }
+    if (itemService.boolValue(attributes, "no_block_drops")) {
+      event.setDropItems(false);
+    }
+    optionalParticle(attributes.get("mining_particles")).ifPresent(particle -> player.getWorld()
+        .spawnParticle(particle, event.getBlock().getLocation().add(0.5, 0.6, 0.5), 18, 0.35, 0.35,
+            0.35, 0.02));
+    Set<Block> extra = collectExtraBlocks(event.getBlock(), player, attributes);
+    if (!extra.isEmpty()) {
+      for (Block block : extra) {
+        if (block.equals(event.getBlock())) {
+          continue;
+        }
+        if (!passesBlockLists(block, attributes)) {
+          continue;
+        }
+        String key = locationKey(block.getLocation());
+        breakGuard.add(key);
+        block.breakNaturally(held);
+        breakGuard.remove(key);
+      }
+    }
+    itemService.consumeUse(player, held);
+  }
+
+  @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+  public void onBlockDropItems(BlockDropItemEvent event) {
+    Player player = event.getPlayer();
+    ItemStack held = player.getInventory().getItemInMainHand();
+    if (itemService.customItemId(held).isEmpty()) {
+      return;
+    }
+    Map<String, String> attributes = itemService.resolveAttributes(held);
+    if (itemService.boolValue(attributes, "no_block_drops")) {
+      event.getItems().forEach(Entity::remove);
+      event.getItems().clear();
+      return;
+    }
+    boolean autoSmelt = itemService.boolValue(attributes, "auto_smelt");
+    double multiplier = itemService.doubleValue(attributes, "block_drop_multiplier").orElse(1.0);
+    multiplier *= itemService.doubleValue(attributes, "fortune_mode").orElse(1.0);
+    List<ItemStack> extras = new ArrayList<>();
+    for (Item itemEntity : event.getItems()) {
+      ItemStack stack = itemEntity.getItemStack();
+      if (autoSmelt) {
+        stack = smeltResult(stack).orElse(stack);
+      }
+      itemEntity.setItemStack(stack);
+      if (multiplier > 1.0) {
+        int extraAmount = Math.max(0, (int) Math.floor(stack.getAmount() * (multiplier - 1.0)));
+        if (extraAmount > 0) {
+          ItemStack copied = stack.clone();
+          copied.setAmount(extraAmount);
+          extras.add(copied);
+        }
+      }
+    }
+    Location location = event.getBlock().getLocation().add(0.5, 0.5, 0.5);
+    for (ItemStack extraDrop : extras) {
+      event.getBlock().getWorld().dropItemNaturally(location, extraDrop);
+    }
+  }
+
+  @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+  public void onInteract(PlayerInteractEvent event) {
+    if (event.getHand() != EquipmentSlot.HAND) {
+      return;
+    }
+    Action action = event.getAction();
+    if (action != Action.RIGHT_CLICK_AIR && action != Action.RIGHT_CLICK_BLOCK) {
+      return;
+    }
+    Player player = event.getPlayer();
+    ItemStack held = player.getInventory().getItemInMainHand();
+    if (itemService.customItemId(held).isEmpty()) {
+      return;
+    }
+    Map<String, String> attributes = itemService.resolveAttributes(held);
+    if (!itemService.canUse(player, held, null, true)) {
+      event.setCancelled(true);
+      return;
+    }
+    if (event.getClickedBlock() != null && itemService.boolValue(attributes, "sell_container")) {
+      if (!itemService.canTriggerAction(player, held, "sell_container", true)) {
+        return;
+      }
+      SellOutcome outcome = sellContainerService.sellContainer(player, event.getClickedBlock());
+      if (outcome.handled()) {
+        event.setCancelled(true);
+        if (outcome.success()) {
+          player.sendMessage(color("&a" + outcome.message()));
+          itemService.consumeUse(player, held);
+        } else if (!outcome.message().isBlank()) {
+          player.sendMessage(color("&e" + outcome.message()));
+        }
+        return;
+      }
+    }
+    if (!itemService.canTriggerAction(player, held, "right_click", false)) {
+      return;
+    }
+    if (event.getClickedBlock() != null) {
+      applyTillRadius(player, event.getClickedBlock(), attributes);
+      applyPlacementRadius(player, event.getClickedBlock(), held, attributes);
+      applyBlockReplace(player, event.getClickedBlock(), attributes);
+    }
+    useRightClickAbilities(player, held, attributes);
+    playUseSound(player, attributes);
+    itemService.consumeUse(player, held);
+  }
+
+  @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+  public void onSneak(PlayerToggleSneakEvent event) {
+    if (!event.isSneaking()) {
+      return;
+    }
+    Player player = event.getPlayer();
+    ItemStack held = player.getInventory().getItemInMainHand();
+    if (itemService.customItemId(held).isEmpty()) {
+      return;
+    }
+    Map<String, String> attributes = itemService.resolveAttributes(held);
+    if (!itemService.canUse(player, held, null, false)) {
+      return;
+    }
+    String shiftAbility = attributes.get("shift_ability");
+    if (shiftAbility == null || shiftAbility.isBlank()) {
+      return;
+    }
+    if (!itemService.canTriggerAction(player, held, "shift_ability", false)) {
+      return;
+    }
+    triggerNamedAbility(player, held, shiftAbility, attributes);
+    itemService.consumeUse(player, held);
+  }
+
+  @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+  public void onDamage(EntityDamageByEntityEvent event) {
+    Player attacker = resolveAttacker(event.getDamager());
+    if (attacker == null) {
+      return;
+    }
+    if (combatEffectGuard.contains(attacker.getUniqueId())) {
+      return;
+    }
+    ItemStack held = attacker.getInventory().getItemInMainHand();
+    if (itemService.customItemId(held).isEmpty()) {
+      return;
+    }
+    if (!itemService.canUse(attacker, held, event.getEntity(), true)) {
+      event.setCancelled(true);
+      return;
+    }
+    Map<String, String> attributes = itemService.resolveAttributes(held);
+    applyCombatAttributes(attacker, event, attributes);
+    playHitSound(attacker, attributes);
+    itemService.consumeUse(attacker, held);
+  }
+
+  @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+  public void onMove(PlayerMoveEvent event) {
+    Player player = event.getPlayer();
+    ItemStack held = player.getInventory().getItemInMainHand();
+    if (itemService.customItemId(held).isEmpty()) {
+      return;
+    }
+    Map<String, String> attributes = itemService.resolveAttributes(held);
+    applyGlide(player, attributes);
+    updateDoubleJumpState(player, attributes);
+    if (!isMovementTickDue(player)) {
+      return;
+    }
+    applyMagnetModes(player, attributes);
+  }
+
+  @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+  public void onToggleFlight(PlayerToggleFlightEvent event) {
+    Player player = event.getPlayer();
+    if (player.getAllowFlight() && !player.isFlying()) {
+      ItemStack held = player.getInventory().getItemInMainHand();
+      if (itemService.customItemId(held).isEmpty()) {
+        return;
+      }
+      Map<String, String> attributes = itemService.resolveAttributes(held);
+      if (!itemService.boolValue(attributes, "double_jump")) {
+        return;
+      }
+      event.setCancelled(true);
+      player.setFlying(false);
+      player.setAllowFlight(false);
+      Vector jump = player.getLocation().getDirection().multiply(0.7).setY(0.75);
+      player.setVelocity(player.getVelocity().add(jump));
+      player.getWorld().spawnParticle(Particle.CLOUD, player.getLocation().add(0, 0.1, 0), 14, 0.3,
+          0.2, 0.3, 0.01);
+      itemService.consumeUse(player, held);
+    }
+  }
+
+  @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+  public void onDrop(PlayerDropItemEvent event) {
+    ItemStack dropped = event.getItemDrop().getItemStack();
+    if (itemService.customItemId(dropped).isEmpty()) {
+      return;
+    }
+    Map<String, String> attributes = itemService.resolveAttributes(dropped);
+    if (itemService.boolValue(attributes, "soulbound")) {
+      event.setCancelled(true);
+      event.getPlayer().sendMessage(color("&cSoulbound items cannot be dropped."));
+    }
+  }
+
+  @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+  public void onInventoryClick(InventoryClickEvent event) {
+    if (event.getWhoClicked() instanceof Player player) {
+      Bukkit.getScheduler().runTask(plugin, () -> itemService.synchronizeInventory(player));
+    }
+    ItemStack current = event.getCurrentItem();
+    if (current == null || itemService.customItemId(current).isEmpty()) {
+      return;
+    }
+    Map<String, String> attributes = itemService.resolveAttributes(current);
+    if (!itemService.boolValue(attributes, "soulbound")) {
+      return;
+    }
+    if (event.getClickedInventory() != null
+        && event.getWhoClicked() instanceof Player player
+        && event.getClickedInventory() != player.getInventory()) {
+      event.setCancelled(true);
+    }
+  }
+
+  @EventHandler(priority = EventPriority.HIGH)
+  public void onDeath(PlayerDeathEvent event) {
+    List<ItemStack> toKeep = new ArrayList<>();
+    for (ItemStack stack : event.getDrops()) {
+      if (itemService.customItemId(stack).isPresent()) {
+        Map<String, String> attributes = itemService.resolveAttributes(stack);
+        if (itemService.boolValue(attributes, "soulbound")) {
+          toKeep.add(stack);
+        }
+      }
+    }
+    if (!toKeep.isEmpty()) {
+      event.getDrops().removeAll(toKeep);
+      event.getItemsToKeep().addAll(toKeep);
+    }
+  }
+
+  @EventHandler(priority = EventPriority.MONITOR)
+  public void onJoin(PlayerJoinEvent event) {
+    Bukkit.getScheduler().runTask(plugin, () -> itemService.synchronizeInventory(event.getPlayer()));
+  }
+
+  private void useRightClickAbilities(Player player, ItemStack held, Map<String, String> attributes) {
+    itemService.doubleValue(attributes, "teleport_on_right_click")
+        .ifPresent(distance -> teleportForward(player, distance));
+    itemService.doubleValue(attributes, "dash_ability").ifPresent(strength -> {
+      Vector dash = player.getLocation().getDirection().normalize().multiply(strength);
+      dash.setY(Math.max(dash.getY(), 0.15));
+      player.setVelocity(player.getVelocity().add(dash));
+    });
+    if (itemService.boolValue(attributes, "projectile_launch")
+        || attributes.containsKey("projectile_launch")) {
+      launchConfiguredProjectile(player, attributes.get("projectile_launch"));
+    }
+    itemService.doubleValue(attributes, "area_ability").ifPresent(radius -> applyAreaAbility(player,
+        radius));
+    itemService.doubleValue(attributes, "gravity_pull").ifPresent(radius -> pullNearbyEntities(
+        player, radius, 0.55));
+    itemService.doubleValue(attributes, "explosion_ability").ifPresent(power -> player.getWorld()
+        .createExplosion(player.getLocation(), power.floatValue(), false, false, player));
+    itemService.intValue(attributes, "time_slow_ability").ifPresent(seconds -> applySlowNearby(
+        player, seconds));
+    String summon = attributes.get("summon_entity");
+    if (summon != null && !summon.isBlank()) {
+      spawnEntityNearPlayer(player, summon);
+    }
+    String namedAbility = attributes.get("right_click_ability");
+    if (namedAbility != null && !namedAbility.isBlank()) {
+      triggerNamedAbility(player, held, namedAbility, attributes);
+    }
+  }
+
+  private void applyCombatAttributes(
+      Player attacker,
+      EntityDamageByEntityEvent event,
+      Map<String, String> attributes) {
+    double damage = event.getDamage();
+    damage += itemService.doubleValue(attributes, "attack_damage").orElse(0.0);
+    if (event.getEntity() instanceof Player) {
+      damage += itemService.doubleValue(attributes, "bonus_damage_vs_players").orElse(0.0);
+    } else {
+      damage += itemService.doubleValue(attributes, "bonus_damage_vs_mobs").orElse(0.0);
+    }
+    double armorPenetration = itemService.doubleValue(attributes, "armor_penetration").orElse(0.0);
+    if (armorPenetration > 0.0) {
+      damage += damage * armorPenetration;
+    }
+    if (rollCritical(attributes)) {
+      double critMulti = itemService.doubleValue(attributes, "critical_damage_multiplier")
+          .orElse(1.5);
+      damage *= critMulti;
+      attacker.getWorld().spawnParticle(Particle.CRIT, event.getEntity().getLocation().add(0, 1, 0),
+          16, 0.2, 0.3, 0.2, 0.0);
+    }
+    event.setDamage(damage);
+    double finalDamage = damage;
+    if (event.getEntity() instanceof LivingEntity target) {
+      itemService.doubleValue(attributes, "knockback_strength")
+          .ifPresent(strength -> {
+            Vector direction = target.getLocation().toVector().subtract(attacker.getLocation()
+                    .toVector())
+                .normalize();
+            target.setVelocity(target.getVelocity().add(direction.multiply(strength)));
+          });
+      itemService.doubleValue(attributes, "life_steal").ifPresent(amount -> {
+        org.bukkit.attribute.AttributeInstance maxHealth = attacker.getAttribute(
+            org.bukkit.attribute.Attribute.MAX_HEALTH);
+        double cap = maxHealth == null ? 20.0 : maxHealth.getValue();
+        attacker.setHealth(Math.min(cap, attacker.getHealth() + finalDamage * amount));
+      });
+      itemService.intValue(attributes, "burn_target").ifPresent(seconds -> target.setFireTicks(
+          seconds * 20));
+      itemService.intValue(attributes, "freeze_target")
+          .ifPresent(seconds -> target.setFreezeTicks(seconds * 20));
+      itemService.intValue(attributes, "poison_target")
+          .ifPresent(seconds -> target.addPotionEffect(new PotionEffect(PotionEffectType.POISON,
+              seconds * 20, 0, true, true, true)));
+      if (itemService.boolValue(attributes, "shield_breaker") && target instanceof Player player) {
+        player.setCooldown(Material.SHIELD, 80);
+      }
+      itemService.doubleValue(attributes, "sweeping_radius")
+          .ifPresent(radius -> sweepDamage(attacker, target, finalDamage * 0.5, radius));
+      itemService.doubleValue(attributes, "multi_target_strike")
+          .ifPresent(radius -> sweepDamage(attacker, target, finalDamage * 0.75, radius));
+      itemService.intValue(attributes, "chain_lightning")
+          .ifPresent(hops -> chainLightning(attacker, target, hops, finalDamage * 0.4));
+      itemService.doubleValue(attributes, "explosive_hit")
+          .ifPresent(power -> target.getWorld().createExplosion(target.getLocation(),
+              power.floatValue(), false, false, attacker));
+      itemService.doubleValue(attributes, "pull_effect")
+          .ifPresent(radius -> pullNearbyEntities(attacker, radius, 0.4));
+      itemService.doubleValue(attributes, "push_effect")
+          .ifPresent(radius -> pushNearbyEntities(attacker, radius, 0.8));
+    }
+    int hits = comboHits.getOrDefault(attacker.getUniqueId(), 0) + 1;
+    comboHits.put(attacker.getUniqueId(), hits);
+    int comboNeeded = itemService.intValue(attributes, "combo_system").orElse(0);
+    if (comboNeeded > 0 && hits >= comboNeeded) {
+      comboHits.put(attacker.getUniqueId(), 0);
+      double area = itemService.doubleValue(attributes, "area_ability").orElse(3.0);
+      applyAreaAbility(attacker, area);
+    }
+  }
+
+  private void applyPotionBuffs(Player player, Map<String, String> attributes) {
+    applyOptionalEffect(player, attributes, "speed_bonus", PotionEffectType.SPEED);
+    applyOptionalEffect(player, attributes, "jump_boost", PotionEffectType.JUMP_BOOST);
+    applyOptionalEffect(player, attributes, "haste", PotionEffectType.HASTE);
+    applyOptionalEffect(player, attributes, "strength_boost", PotionEffectType.STRENGTH);
+    applyOptionalEffect(player, attributes, "regeneration", PotionEffectType.REGENERATION);
+    if (itemService.boolValue(attributes, "night_vision")) {
+      player.addPotionEffect(new PotionEffect(PotionEffectType.NIGHT_VISION, 60, 0, true, false,
+          false));
+    }
+    if (itemService.boolValue(attributes, "water_breathing")) {
+      player.addPotionEffect(new PotionEffect(PotionEffectType.WATER_BREATHING, 60, 0, true, false,
+          false));
+    }
+    if (itemService.boolValue(attributes, "fire_resistance")) {
+      player.addPotionEffect(new PotionEffect(PotionEffectType.FIRE_RESISTANCE, 60, 0, true,
+          false, false));
+    }
+    itemService.doubleValue(attributes, "health_bonus").ifPresent(healthBonus -> {
+      int amplifier = Math.max(0, (int) Math.floor(healthBonus / 4.0));
+      player.addPotionEffect(new PotionEffect(PotionEffectType.HEALTH_BOOST, 60, amplifier, true,
+          false, false));
+    });
+    itemService.doubleValue(attributes, "absorption_hearts").ifPresent(extra -> {
+      int amplifier = Math.max(0, (int) Math.floor(extra / 4.0));
+      player.addPotionEffect(new PotionEffect(PotionEffectType.ABSORPTION, 60, amplifier, true,
+          false, false));
+    });
+  }
+
+  private void applyTrailParticles(Player player, Map<String, String> attributes) {
+    String particleName = attributes.get("particle_trail");
+    if (particleName == null || particleName.isBlank()) {
+      return;
+    }
+    optionalParticle(particleName).ifPresent(particle -> player.getWorld().spawnParticle(particle,
+        player.getLocation().add(0, 0.15, 0), 10, 0.25, 0.1, 0.25, 0.01));
+  }
+
+  private void applyBlockHighlighting(Player player, Map<String, String> attributes) {
+    if (!itemService.boolValue(attributes, "block_highlighting")) {
+      return;
+    }
+    Location base = player.getLocation();
+    int radius = 8;
+    int highlighted = 0;
+    for (int x = -radius; x <= radius && highlighted < 48; x++) {
+      for (int y = -4; y <= 4 && highlighted < 48; y++) {
+        for (int z = -radius; z <= radius && highlighted < 48; z++) {
+          Block block = base.getBlock().getRelative(x, y, z);
+          if (isValuable(block.getType())) {
+            player.spawnParticle(Particle.END_ROD, block.getLocation().add(0.5, 0.5, 0.5), 1,
+                0.0, 0.0, 0.0, 0.0);
+            highlighted++;
+          }
+        }
+      }
+    }
+  }
+
+  private void applyMobDetection(Player player, Map<String, String> attributes) {
+    if (!itemService.boolValue(attributes, "mob_detection")) {
+      return;
+    }
+    double radius = plugin.getConfig().getDouble("mob-detection-radius", 22.0);
+    for (Entity entity : player.getNearbyEntities(radius, radius, radius)) {
+      if (entity instanceof LivingEntity living && !(living instanceof Player)) {
+        living.addPotionEffect(new PotionEffect(PotionEffectType.GLOWING, 40, 0, true, false,
+            false));
+      }
+    }
+  }
+
+  private void applyMagnetModes(Player player, Map<String, String> attributes) {
+    boolean magnetMode = itemService.boolValue(attributes, "magnet_mode");
+    boolean autoPickup = itemService.boolValue(attributes, "auto_pickup");
+    boolean xpMagnet = itemService.boolValue(attributes, "xp_magnet");
+    double radius = itemService.doubleValue(attributes, "item_vacuum_radius")
+        .orElse(plugin.getConfig().getDouble("default-item-vacuum-radius", 6.0));
+    if (!magnetMode && !autoPickup && !xpMagnet) {
+      return;
+    }
+    for (Entity entity : player.getNearbyEntities(radius, radius, radius)) {
+      if (entity instanceof Item item) {
+        if (autoPickup) {
+          HashMap<Integer, ItemStack> overflow = player.getInventory().addItem(item.getItemStack());
+          if (overflow.isEmpty()) {
+            item.remove();
+          }
+        } else if (magnetMode) {
+          Vector velocity = player.getLocation().toVector().subtract(item.getLocation().toVector())
+              .multiply(0.18);
+          item.setVelocity(velocity);
+        }
+      }
+      if (xpMagnet && entity instanceof ExperienceOrb orb) {
+        Vector velocity = player.getLocation().toVector().subtract(orb.getLocation().toVector())
+            .multiply(0.2);
+        orb.setVelocity(velocity);
+      }
+    }
+  }
+
+  private void applyGlide(Player player, Map<String, String> attributes) {
+    if (!itemService.boolValue(attributes, "glide_mode")) {
+      return;
+    }
+    if (!player.isOnGround() && player.getVelocity().getY() < -0.08) {
+      Vector velocity = player.getVelocity().clone();
+      velocity.setY(Math.max(-0.08, velocity.getY() * 0.55));
+      player.setVelocity(velocity);
+      player.setFallDistance(0.0f);
+    }
+  }
+
+  private void updateDoubleJumpState(Player player, Map<String, String> attributes) {
+    if (player.getGameMode().name().equals("CREATIVE")
+        || player.getGameMode().name().equals("SPECTATOR")) {
+      return;
+    }
+    if (itemService.boolValue(attributes, "double_jump") && player.isOnGround()) {
+      player.setAllowFlight(true);
+    } else if (!itemService.boolValue(attributes, "double_jump") && player.getAllowFlight()) {
+      player.setAllowFlight(false);
+    }
+  }
+
+  private void applyTillRadius(Player player, Block clicked, Map<String, String> attributes) {
+    int radius = itemService.intValue(attributes, "till_radius").orElse(0);
+    if (radius <= 0) {
+      return;
+    }
+    for (int x = -radius; x <= radius; x++) {
+      for (int z = -radius; z <= radius; z++) {
+        Block current = clicked.getRelative(x, 0, z);
+        if (current.getType() == Material.DIRT || current.getType() == Material.GRASS_BLOCK
+            || current.getType() == Material.DIRT_PATH) {
+          Block above = current.getRelative(BlockFace.UP);
+          if (above.getType() == Material.AIR) {
+            current.setType(Material.FARMLAND);
+            player.getWorld().spawnParticle(Particle.BLOCK, current.getLocation().add(0.5, 0.5, 0.5),
+                4, 0.2, 0.2, 0.2, Material.FARMLAND.createBlockData());
+          }
+        }
+      }
+    }
+  }
+
+  private void applyPlacementRadius(
+      Player player,
+      Block clicked,
+      ItemStack held,
+      Map<String, String> attributes) {
+    String placement = attributes.get("block_placement_radius");
+    if (placement == null || placement.isBlank()) {
+      return;
+    }
+    Material placeMaterial = held.getType();
+    if (!placeMaterial.isBlock()) {
+      return;
+    }
+    String[] split = placement.toLowerCase(Locale.ROOT).split(":");
+    String mode = split[0];
+    int value = split.length >= 2 ? safeParseInt(split[1], 3) : 3;
+    Location origin = clicked.getLocation().add(0, 1, 0);
+    if (mode.equals("line")) {
+      Vector direction = player.getLocation().getDirection().setY(0).normalize();
+      for (int i = 1; i <= value; i++) {
+        Block target = origin.clone().add(direction.clone().multiply(i)).getBlock();
+        if (target.getType() == Material.AIR) {
+          target.setType(placeMaterial);
+        }
+      }
+    } else if (mode.equals("wall")) {
+      for (int y = 0; y < value; y++) {
+        for (int x = -value; x <= value; x++) {
+          Block target = origin.getBlock().getRelative(x, y, 0);
+          if (target.getType() == Material.AIR) {
+            target.setType(placeMaterial);
+          }
+        }
+      }
+    } else {
+      int radius = Math.max(1, value / 2);
+      for (int x = -radius; x <= radius; x++) {
+        for (int z = -radius; z <= radius; z++) {
+          Block target = origin.getBlock().getRelative(x, 0, z);
+          if (target.getType() == Material.AIR) {
+            target.setType(placeMaterial);
+          }
+        }
+      }
+    }
+  }
+
+  private void applyBlockReplace(Player player, Block clicked, Map<String, String> attributes) {
+    String replace = attributes.get("block_replace_mode");
+    if (replace == null || replace.isBlank()) {
+      return;
+    }
+    String[] split = replace.split(">");
+    if (split.length != 2) {
+      return;
+    }
+    Material from = safeMaterial(split[0]);
+    Material to = safeMaterial(split[1]);
+    if (from == null || to == null) {
+      return;
+    }
+    int radius = Math.max(1, itemService.intValue(attributes, "break_radius")
+        .orElse(plugin.getConfig().getInt("default-break-radius", 1)));
+    Location center = clicked.getLocation();
+    for (int x = -radius; x <= radius; x++) {
+      for (int y = -radius; y <= radius; y++) {
+        for (int z = -radius; z <= radius; z++) {
+          Block target = center.getBlock().getRelative(x, y, z);
+          if (target.getType() == from) {
+            target.setType(to);
+          }
+        }
+      }
+    }
+    player.getWorld().playSound(center, Sound.BLOCK_STONE_PLACE, 0.8f, 1.2f);
+  }
+
+  private Set<Block> collectExtraBlocks(Block origin, Player player, Map<String, String> attributes) {
+    if (itemService.boolValue(attributes, "vein_mining") && isOreBlock(origin.getType())) {
+      int max = plugin.getConfig().getInt("max-vein-size", 96);
+      return collectConnected(origin, origin.getType(), max);
+    }
+    if (itemService.boolValue(attributes, "tree_feller") && origin.getType().name().endsWith("_LOG")) {
+      return collectTree(origin, 196);
+    }
+    int cropRadius = itemService.intValue(attributes, "crop_harvester").orElse(0);
+    if (cropRadius > 0) {
+      return collectCrops(origin, cropRadius);
+    }
+    String volume = attributes.get("break_volume");
+    if (volume != null && !volume.isBlank()) {
+      int[] dims = parseVolume(volume);
+      return collectVolume(origin, player, attributes, dims[0], dims[1], dims[2]);
+    }
+    int radius = itemService.intValue(attributes, "break_radius").orElse(0);
+    if (radius > 0) {
+      int size = radius * 2 + 1;
+      return collectVolume(origin, player, attributes, size, 1, size);
+    }
+    return Set.of();
+  }
+
+  private boolean isOreBlock(Material material) {
+    if (material == Material.ANCIENT_DEBRIS) {
+      return true;
+    }
+    return material.name().endsWith("_ORE");
+  }
+
+  private Set<Block> collectVolume(
+      Block origin,
+      Player player,
+      Map<String, String> attributes,
+      int width,
+      int height,
+      int depth) {
+    Set<Block> blocks = new HashSet<>();
+    int halfWidth = Math.max(0, width / 2);
+    int halfDepth = Math.max(0, depth / 2);
+    int halfHeight = Math.max(0, height / 2);
+    boolean directional = itemService.boolValue(attributes, "directional_mining");
+    Vector direction = player.getLocation().getDirection();
+    int directionSign = direction.getY() > 0.45 ? 1 : direction.getY() < -0.45 ? -1 : 0;
+    for (int x = -halfWidth; x <= halfWidth; x++) {
+      for (int y = -halfHeight; y <= halfHeight; y++) {
+        for (int z = -halfDepth; z <= halfDepth; z++) {
+          int targetY = directional ? y + directionSign : y;
+          Block relative = origin.getRelative(x, targetY, z);
+          if (relative.getType() != Material.AIR && !isUnbreakableBlock(relative.getType())) {
+            blocks.add(relative);
+          }
+        }
+      }
+    }
+    return blocks;
+  }
+
+  private Set<Block> collectConnected(Block origin, Material type, int max) {
+    Set<Block> found = new HashSet<>();
+    ArrayDeque<Block> queue = new ArrayDeque<>();
+    queue.add(origin);
+    while (!queue.isEmpty() && found.size() < max) {
+      Block current = queue.poll();
+      if (!found.add(current)) {
+        continue;
+      }
+      for (int x = -1; x <= 1; x++) {
+        for (int y = -1; y <= 1; y++) {
+          for (int z = -1; z <= 1; z++) {
+            Block relative = current.getRelative(x, y, z);
+            if (relative.getType() == type
+                && !isUnbreakableBlock(relative.getType())
+                && !found.contains(relative)) {
+              queue.add(relative);
+            }
+          }
+        }
+      }
+    }
+    return found;
+  }
+
+  private Set<Block> collectTree(Block origin, int max) {
+    Set<Block> found = new HashSet<>();
+    ArrayDeque<Block> queue = new ArrayDeque<>();
+    queue.add(origin);
+    while (!queue.isEmpty() && found.size() < max) {
+      Block current = queue.poll();
+      if (!found.add(current)) {
+        continue;
+      }
+      for (int x = -1; x <= 1; x++) {
+        for (int y = -1; y <= 1; y++) {
+          for (int z = -1; z <= 1; z++) {
+            Block relative = current.getRelative(x, y, z);
+            String type = relative.getType().name();
+            if ((type.endsWith("_LOG") || type.endsWith("_LEAVES"))
+                && !isUnbreakableBlock(relative.getType())
+                && !found.contains(relative)) {
+              queue.add(relative);
+            }
+          }
+        }
+      }
+    }
+    return found;
+  }
+
+  private Set<Block> collectCrops(Block origin, int radius) {
+    Set<Block> crops = new HashSet<>();
+    for (int x = -radius; x <= radius; x++) {
+      for (int z = -radius; z <= radius; z++) {
+        Block block = origin.getRelative(x, 0, z);
+        if (!isUnbreakableBlock(block.getType()) && isHarvestableCrop(block)) {
+          crops.add(block);
+        }
+      }
+    }
+    return crops;
+  }
+
+  private boolean isHarvestableCrop(Block block) {
+    if (!(block.getBlockData() instanceof Ageable ageable)) {
+      return false;
+    }
+    return ageable.getAge() >= ageable.getMaximumAge();
+  }
+
+  private int[] parseVolume(String input) {
+    String[] split = input.toLowerCase(Locale.ROOT).replace(" ", "").split("x");
+    if (split.length != 3) {
+      return new int[] {3, 3, 3};
+    }
+    return new int[] {
+        Math.max(1, safeParseInt(split[0], 3)),
+        Math.max(1, safeParseInt(split[1], 3)),
+        Math.max(1, safeParseInt(split[2], 3))
+    };
+  }
+
+  private void teleportForward(Player player, double distance) {
+    RayTraceResult ray = player.getWorld().rayTraceBlocks(player.getEyeLocation(),
+        player.getLocation().getDirection(), distance);
+    Location target = ray != null && ray.getHitPosition() != null
+        ? ray.getHitPosition().toLocation(player.getWorld())
+        : player.getEyeLocation().add(player.getLocation().getDirection().multiply(distance));
+    target.setPitch(player.getLocation().getPitch());
+    target.setYaw(player.getLocation().getYaw());
+    player.teleport(target);
+    player.getWorld().spawnParticle(Particle.PORTAL, target, 30, 0.4, 0.6, 0.4, 0.01);
+  }
+
+  private void applyAreaAbility(Player player, double radius) {
+    for (Entity entity : player.getNearbyEntities(radius, radius, radius)) {
+      if (!(entity instanceof LivingEntity living) || entity.equals(player)) {
+        continue;
+      }
+      combatEffectGuard.add(player.getUniqueId());
+      living.damage(4.0, player);
+      combatEffectGuard.remove(player.getUniqueId());
+      living.getWorld().spawnParticle(Particle.SWEEP_ATTACK, living.getLocation().add(0, 1, 0), 1,
+          0.0, 0.0, 0.0, 0.0);
+    }
+  }
+
+  private void applySlowNearby(Player player, int seconds) {
+    for (Entity entity : player.getNearbyEntities(6.0, 4.0, 6.0)) {
+      if (entity instanceof LivingEntity living && !entity.equals(player)) {
+        living.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, seconds * 20, 1, true,
+            true, true));
+      }
+    }
+  }
+
+  private void spawnEntityNearPlayer(Player player, String entityName) {
+    try {
+      EntityType type = EntityType.valueOf(entityName.toUpperCase(Locale.ROOT));
+      player.getWorld().spawnEntity(player.getLocation().add(0, 0.5, 0), type);
+    } catch (IllegalArgumentException ex) {
+      player.sendMessage(color("&cInvalid summon entity: " + entityName));
+    }
+  }
+
+  private void triggerNamedAbility(
+      Player player,
+      ItemStack held,
+      String abilityName,
+      Map<String, String> attributes) {
+    String normalized = abilityName.toLowerCase(Locale.ROOT);
+    if (normalized.equals("heal")) {
+      player.setHealth(Math.min(player.getAttribute(org.bukkit.attribute.Attribute.MAX_HEALTH)
+          .getValue(), player.getHealth() + 6.0));
+      player.getWorld().spawnParticle(Particle.HEART, player.getLocation().add(0, 1, 0), 6, 0.4,
+          0.3, 0.4, 0.01);
+    } else if (normalized.equals("blink")) {
+      double distance = itemService.doubleValue(attributes, "teleport_on_right_click").orElse(6.0);
+      teleportForward(player, distance);
+    } else if (normalized.equals("burst")) {
+      double radius = itemService.doubleValue(attributes, "area_ability").orElse(4.0);
+      applyAreaAbility(player, radius);
+    } else if (normalized.equals("projectile")) {
+      launchConfiguredProjectile(player, attributes.get("projectile_launch"));
+    } else if (normalized.equals("block")) {
+      int seconds = itemService.intValue(attributes, "block_ability").orElse(4);
+      player.addPotionEffect(new PotionEffect(PotionEffectType.RESISTANCE, seconds * 20, 2, true,
+          true, true));
+    }
+  }
+
+  private void launchConfiguredProjectile(Player player, String value) {
+    String config = value == null || value.isBlank() ? "arrow:2.0" : value;
+    String[] split = config.split(":");
+    String projectileName = split[0].toLowerCase(Locale.ROOT);
+    double speed = split.length > 1 ? safeParseDouble(split[1], 2.0) : 2.0;
+    Projectile projectile;
+    if (projectileName.equals("snowball")) {
+      projectile = player.launchProjectile(org.bukkit.entity.Snowball.class);
+    } else if (projectileName.equals("egg")) {
+      projectile = player.launchProjectile(org.bukkit.entity.Egg.class);
+    } else if (projectileName.equals("trident")) {
+      projectile = player.launchProjectile(org.bukkit.entity.Trident.class);
+    } else if (projectileName.equals("fireball")) {
+      projectile = player.launchProjectile(org.bukkit.entity.Fireball.class);
+    } else {
+      projectile = player.launchProjectile(AbstractArrow.class);
+    }
+    projectile.setVelocity(player.getLocation().getDirection().normalize().multiply(speed));
+  }
+
+  private void pullNearbyEntities(Player player, double radius, double strength) {
+    for (Entity entity : player.getNearbyEntities(radius, radius, radius)) {
+      if (entity instanceof LivingEntity living && !living.equals(player)) {
+        Vector pull = player.getLocation().toVector().subtract(entity.getLocation().toVector())
+            .normalize().multiply(strength);
+        entity.setVelocity(entity.getVelocity().add(pull));
+      }
+    }
+  }
+
+  private void pushNearbyEntities(Player player, double radius, double strength) {
+    for (Entity entity : player.getNearbyEntities(radius, radius, radius)) {
+      if (entity instanceof LivingEntity living && !living.equals(player)) {
+        Vector push = entity.getLocation().toVector().subtract(player.getLocation().toVector())
+            .normalize().multiply(strength);
+        entity.setVelocity(entity.getVelocity().add(push));
+      }
+    }
+  }
+
+  private void sweepDamage(Player attacker, LivingEntity center, double damage, double radius) {
+    for (Entity entity : center.getNearbyEntities(radius, radius, radius)) {
+      if (entity.equals(attacker) || entity.equals(center) || !(entity instanceof LivingEntity living)) {
+        continue;
+      }
+      combatEffectGuard.add(attacker.getUniqueId());
+      living.damage(damage, attacker);
+      combatEffectGuard.remove(attacker.getUniqueId());
+    }
+  }
+
+  private void chainLightning(Player attacker, LivingEntity first, int hops, double hopDamage) {
+    if (hops <= 0) {
+      return;
+    }
+    List<LivingEntity> chain = new ArrayList<>();
+    chain.add(first);
+    LivingEntity current = first;
+    for (int i = 0; i < hops; i++) {
+      Location currentLocation = current.getLocation();
+      Optional<LivingEntity> next = current.getNearbyEntities(6.0, 6.0, 6.0)
+          .stream()
+          .filter(entity -> entity instanceof LivingEntity)
+          .map(entity -> (LivingEntity) entity)
+          .filter(entity -> !entity.equals(attacker))
+          .filter(entity -> !chain.contains(entity))
+          .min(Comparator.comparingDouble(entity -> entity.getLocation().distanceSquared(
+              currentLocation)));
+      if (next.isEmpty()) {
+        break;
+      }
+      LivingEntity victim = next.get();
+      chain.add(victim);
+      combatEffectGuard.add(attacker.getUniqueId());
+      victim.damage(hopDamage, attacker);
+      combatEffectGuard.remove(attacker.getUniqueId());
+      victim.getWorld().spawnParticle(Particle.ELECTRIC_SPARK, victim.getLocation().add(0, 1, 0),
+          10, 0.2, 0.3, 0.2, 0.03);
+      current = victim;
+    }
+  }
+
+  private Optional<ItemStack> smeltResult(ItemStack input) {
+    for (Recipe recipe : Bukkit.getRecipesFor(input)) {
+      if (recipe instanceof CookingRecipe<?> cookingRecipe) {
+        ItemStack result = cookingRecipe.getResult().clone();
+        result.setAmount(Math.max(1, result.getAmount() * input.getAmount()));
+        return Optional.of(result);
+      }
+    }
+    return Optional.empty();
+  }
+
+  private void applyOptionalEffect(
+      Player player,
+      Map<String, String> attributes,
+      String attribute,
+      PotionEffectType effectType) {
+    itemService.intValue(attributes, attribute)
+        .ifPresent(level -> player.addPotionEffect(new PotionEffect(effectType, 60,
+            Math.max(0, level), true, false, false)));
+  }
+
+  private void playUseSound(Player player, Map<String, String> attributes) {
+    String soundName = attributes.get("sound_on_use");
+    if (soundName == null || soundName.isBlank()) {
+      return;
+    }
+    optionalSound(soundName).ifPresent(sound -> player.getWorld().playSound(player.getLocation(),
+        sound, 0.8f, 1.0f));
+  }
+
+  private void playHitSound(Player player, Map<String, String> attributes) {
+    String soundName = attributes.get("sound_on_hit");
+    if (soundName == null || soundName.isBlank()) {
+      return;
+    }
+    optionalSound(soundName).ifPresent(sound -> player.getWorld().playSound(player.getLocation(),
+        sound, 1.0f, 1.0f));
+  }
+
+  private void animateLoreIfNeeded(ItemStack held, Map<String, String> attributes) {
+    String animation = attributes.get("animated_lore");
+    if (animation == null || animation.isBlank()) {
+      return;
+    }
+    String[] frames = animation.split("\\|");
+    if (frames.length == 0) {
+      return;
+    }
+    int index = (int) ((System.currentTimeMillis() / 1000L) % frames.length);
+    ItemMeta meta = held.getItemMeta();
+    if (meta == null || meta.lore() == null || meta.lore().isEmpty()) {
+      return;
+    }
+    List<net.kyori.adventure.text.Component> lore = new ArrayList<>(meta.lore());
+    lore.set(0, serializer.deserialize(frames[index]));
+    meta.lore(lore);
+    held.setItemMeta(meta);
+  }
+
+  private boolean rollCritical(Map<String, String> attributes) {
+    double chance = itemService.doubleValue(attributes, "critical_chance").orElse(0.0);
+    if (chance <= 0.0) {
+      return false;
+    }
+    return Math.random() <= chance;
+  }
+
+  private boolean passesBlockLists(Block block, Map<String, String> attributes) {
+    if (isUnbreakableBlock(block.getType())) {
+      return false;
+    }
+    String whitelist = attributes.get("block_whitelist");
+    if (whitelist != null && !whitelist.isBlank()) {
+      boolean matched = parseMaterialList(whitelist).contains(block.getType());
+      if (!matched) {
+        return false;
+      }
+    }
+    String blacklist = attributes.get("block_blacklist");
+    return blacklist == null || !parseMaterialList(blacklist).contains(block.getType());
+  }
+
+  private boolean isUnbreakableBlock(Material material) {
+    if (!material.isBlock()) {
+      return false;
+    }
+    try {
+      if (material.getHardness() < 0.0f) {
+        return true;
+      }
+    } catch (NoSuchMethodError ex) {
+      // Hardness may not exist in older APIs.
+    }
+    return switch (material) {
+      case BEDROCK,
+          BARRIER,
+          END_PORTAL_FRAME,
+          END_PORTAL,
+          NETHER_PORTAL,
+          END_GATEWAY,
+          COMMAND_BLOCK,
+          CHAIN_COMMAND_BLOCK,
+          REPEATING_COMMAND_BLOCK,
+          STRUCTURE_BLOCK,
+          JIGSAW,
+          LIGHT,
+          RESPAWN_ANCHOR ->
+          true;
+      default -> false;
+    };
+  }
+
+  private Set<Material> parseMaterialList(String value) {
+    Set<Material> materials = new HashSet<>();
+    for (String split : value.split(",")) {
+      Material material = safeMaterial(split);
+      if (material != null) {
+        materials.add(material);
+      }
+    }
+    return materials;
+  }
+
+  private Player resolveAttacker(Entity damager) {
+    if (damager instanceof Player player) {
+      return player;
+    }
+    if (damager instanceof Projectile projectile && projectile.getShooter() instanceof Player player) {
+      return player;
+    }
+    return null;
+  }
+
+  private boolean isValuable(Material material) {
+    return material.name().endsWith("_ORE")
+        || material == Material.ANCIENT_DEBRIS
+        || material == Material.CHEST
+        || material == Material.SPAWNER;
+  }
+
+  private Optional<Particle> optionalParticle(String value) {
+    if (value == null || value.isBlank()) {
+      return Optional.empty();
+    }
+    try {
+      return Optional.of(Particle.valueOf(value.toUpperCase(Locale.ROOT)));
+    } catch (IllegalArgumentException ex) {
+      return Optional.empty();
+    }
+  }
+
+  private Optional<Sound> optionalSound(String value) {
+    if (value == null || value.isBlank()) {
+      return Optional.empty();
+    }
+    try {
+      return Optional.of(Sound.valueOf(value.toUpperCase(Locale.ROOT)));
+    } catch (IllegalArgumentException ex) {
+      return Optional.empty();
+    }
+  }
+
+  private Material safeMaterial(String value) {
+    try {
+      return Material.valueOf(value.trim().toUpperCase(Locale.ROOT));
+    } catch (IllegalArgumentException ex) {
+      return null;
+    }
+  }
+
+  private int safeParseInt(String value, int fallback) {
+    try {
+      return Integer.parseInt(value.trim());
+    } catch (NumberFormatException ex) {
+      return fallback;
+    }
+  }
+
+  private double safeParseDouble(String value, double fallback) {
+    try {
+      return Double.parseDouble(value.trim());
+    } catch (NumberFormatException ex) {
+      return fallback;
+    }
+  }
+
+  private boolean isMovementTickDue(Player player) {
+    long now = System.currentTimeMillis();
+    Long last = movementThrottle.get(player.getUniqueId());
+    if (last == null || now - last >= 150L) {
+      movementThrottle.put(player.getUniqueId(), now);
+      return true;
+    }
+    return false;
+  }
+
+  private String locationKey(Location location) {
+    return location.getWorld().getName() + ':' + location.getBlockX() + ':' + location.getBlockY()
+        + ':' + location.getBlockZ();
+  }
+
+  private String color(String message) {
+    return ChatColor.translateAlternateColorCodes('&', message);
+  }
+}
