@@ -38,9 +38,15 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockDropItemEvent;
+import org.bukkit.event.enchantment.EnchantItemEvent;
+import org.bukkit.event.enchantment.PrepareItemEnchantEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryType;
+import org.bukkit.event.inventory.PrepareAnvilEvent;
+import org.bukkit.event.inventory.PrepareGrindstoneEvent;
+import org.bukkit.event.inventory.PrepareSmithingEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
@@ -49,6 +55,7 @@ import org.bukkit.event.player.PlayerToggleFlightEvent;
 import org.bukkit.event.player.PlayerToggleSneakEvent;
 import org.bukkit.inventory.CookingRecipe;
 import org.bukkit.inventory.EquipmentSlot;
+import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.Recipe;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -135,6 +142,23 @@ public final class CustomItemListener implements Listener {
       player.sendMessage(color("&cThis block is not allowed for this item."));
       return;
     }
+    if (!itemService.canTriggerAction(player, held, "block_break", true)) {
+      event.setCancelled(true);
+      return;
+    }
+    if (itemService.boolValue(attributes, "sell_container")) {
+      SellOutcome outcome = sellContainerService.sellContainer(player, event.getBlock());
+      if (outcome.handled()) {
+        if (outcome.success()) {
+          player.sendMessage(color("&a" + outcome.message()));
+        } else if (!outcome.message().isBlank()) {
+          player.sendMessage(color("&e" + outcome.message()));
+        }
+      }
+    }
+    boolean replantMain = itemService.boolValue(attributes, "auto_replant")
+        && isHarvestableCrop(event.getBlock());
+    Material mainCropType = event.getBlock().getType();
     String locationKey = locationKey(event.getBlock().getLocation());
     if (breakGuard.contains(locationKey)) {
       return;
@@ -154,13 +178,50 @@ public final class CustomItemListener implements Listener {
         if (!passesBlockLists(block, attributes)) {
           continue;
         }
+        boolean replantExtra = itemService.boolValue(attributes, "auto_replant")
+            && isHarvestableCrop(block);
+        Material cropType = block.getType();
         String key = locationKey(block.getLocation());
         breakGuard.add(key);
-        block.breakNaturally(held);
+        breakExtraBlock(block, player, held, attributes);
         breakGuard.remove(key);
+        if (replantExtra) {
+          scheduleCropReplant(block, cropType);
+        }
       }
     }
+    if (replantMain) {
+      scheduleCropReplant(event.getBlock(), mainCropType);
+    }
     itemService.consumeUse(player, held);
+  }
+
+  private void breakExtraBlock(
+      Block block,
+      Player player,
+      ItemStack held,
+      Map<String, String> attributes) {
+    List<ItemStack> drops = new ArrayList<>(block.getDrops(held, player));
+    block.setType(Material.AIR, false);
+    if (itemService.boolValue(attributes, "no_block_drops")) {
+      return;
+    }
+    boolean autoSmelt = itemService.boolValue(attributes, "auto_smelt");
+    double multiplier = itemService.doubleValue(attributes, "block_drop_multiplier").orElse(1.0);
+    multiplier *= itemService.doubleValue(attributes, "fortune_mode").orElse(1.0);
+    Location location = block.getLocation().add(0.5, 0.5, 0.5);
+    for (ItemStack rawDrop : drops) {
+      ItemStack baseDrop = autoSmelt ? smeltResult(rawDrop).orElse(rawDrop.clone()) : rawDrop.clone();
+      block.getWorld().dropItemNaturally(location, baseDrop);
+      if (multiplier > 1.0) {
+        int extraAmount = Math.max(0, (int) Math.floor(baseDrop.getAmount() * (multiplier - 1.0)));
+        if (extraAmount > 0) {
+          ItemStack extraDrop = baseDrop.clone();
+          extraDrop.setAmount(extraAmount);
+          block.getWorld().dropItemNaturally(location, extraDrop);
+        }
+      }
+    }
   }
 
   @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
@@ -220,28 +281,12 @@ public final class CustomItemListener implements Listener {
       event.setCancelled(true);
       return;
     }
-    if (event.getClickedBlock() != null && itemService.boolValue(attributes, "sell_container")) {
-      if (!itemService.canTriggerAction(player, held, "sell_container", true)) {
-        return;
-      }
-      SellOutcome outcome = sellContainerService.sellContainer(player, event.getClickedBlock());
-      if (outcome.handled()) {
-        event.setCancelled(true);
-        if (outcome.success()) {
-          player.sendMessage(color("&a" + outcome.message()));
-          itemService.consumeUse(player, held);
-        } else if (!outcome.message().isBlank()) {
-          player.sendMessage(color("&e" + outcome.message()));
-        }
-        return;
-      }
-    }
     if (!itemService.canTriggerAction(player, held, "right_click", false)) {
       return;
     }
     if (event.getClickedBlock() != null) {
       applyTillRadius(player, event.getClickedBlock(), attributes);
-      applyPlacementRadius(player, event.getClickedBlock(), held, attributes);
+      applyPlacementRadius(player, event.getClickedBlock(), event.getBlockFace(), held, attributes);
       applyBlockReplace(player, event.getClickedBlock(), attributes);
     }
     useRightClickAbilities(player, held, attributes);
@@ -288,6 +333,10 @@ public final class CustomItemListener implements Listener {
       return;
     }
     if (!itemService.canUse(attacker, held, event.getEntity(), true)) {
+      event.setCancelled(true);
+      return;
+    }
+    if (!itemService.canTriggerAction(attacker, held, "attack", true)) {
       event.setCancelled(true);
       return;
     }
@@ -349,10 +398,61 @@ public final class CustomItemListener implements Listener {
     }
   }
 
+  @EventHandler(priority = EventPriority.HIGHEST)
+  public void onPrepareEnchant(PrepareItemEnchantEvent event) {
+    if (!isPluginManagedItem(event.getItem())) {
+      return;
+    }
+    event.setCancelled(true);
+    if (event.getOffers() != null) {
+      for (int index = 0; index < event.getOffers().length; index++) {
+        event.getOffers()[index] = null;
+      }
+    }
+  }
+
+  @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+  public void onEnchantItem(EnchantItemEvent event) {
+    if (!isPluginManagedItem(event.getItem())) {
+      return;
+    }
+    event.setCancelled(true);
+    event.getEnchantsToAdd().clear();
+    event.getEnchanter().sendMessage(color("&cCustom items are unmodifiable."));
+  }
+
+  @EventHandler(priority = EventPriority.HIGHEST)
+  public void onPrepareAnvil(PrepareAnvilEvent event) {
+    if (inventoryHasPluginItem(event.getInventory(), 0, 1)) {
+      event.setResult(null);
+    }
+  }
+
+  @EventHandler(priority = EventPriority.HIGHEST)
+  public void onPrepareGrindstone(PrepareGrindstoneEvent event) {
+    if (inventoryHasPluginItem(event.getInventory(), 0, 1)) {
+      event.setResult(null);
+    }
+  }
+
+  @EventHandler(priority = EventPriority.HIGHEST)
+  public void onPrepareSmithing(PrepareSmithingEvent event) {
+    if (inventoryHasPluginItem(event.getInventory(), 0, 1, 2)) {
+      event.setResult(null);
+    }
+  }
+
   @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
   public void onInventoryClick(InventoryClickEvent event) {
     if (event.getWhoClicked() instanceof Player player) {
       Bukkit.getScheduler().runTask(plugin, () -> itemService.synchronizeInventory(player));
+    }
+    if (isProtectedModificationClick(event)) {
+      event.setCancelled(true);
+      if (event.getWhoClicked() instanceof Player player) {
+        player.sendMessage(color("&cCustom items are unmodifiable."));
+      }
+      return;
     }
     ItemStack current = event.getCurrentItem();
     if (current == null || itemService.customItemId(current).isEmpty()) {
@@ -396,8 +496,10 @@ public final class CustomItemListener implements Listener {
         .ifPresent(distance -> teleportForward(player, distance));
     itemService.doubleValue(attributes, "dash_ability").ifPresent(strength -> {
       Vector dash = player.getLocation().getDirection().normalize().multiply(strength);
-      dash.setY(Math.max(dash.getY(), 0.15));
-      player.setVelocity(player.getVelocity().add(dash));
+      dash.setY(Math.max(dash.getY(), 0.25));
+      player.setVelocity(dash);
+      player.getWorld().spawnParticle(Particle.CLOUD, player.getLocation().add(0, 0.2, 0), 18, 0.2,
+          0.1, 0.2, 0.01);
     });
     if (itemService.boolValue(attributes, "projectile_launch")
         || attributes.containsKey("projectile_launch")) {
@@ -426,7 +528,10 @@ public final class CustomItemListener implements Listener {
       EntityDamageByEntityEvent event,
       Map<String, String> attributes) {
     double damage = event.getDamage();
-    damage += itemService.doubleValue(attributes, "attack_damage").orElse(0.0);
+    double attackDamageBonus = itemService.doubleValue(attributes, "attack_damage").orElse(0.0);
+    if (!(event.getDamager() instanceof Player)) {
+      damage += attackDamageBonus;
+    }
     if (event.getEntity() instanceof Player) {
       damage += itemService.doubleValue(attributes, "bonus_damage_vs_players").orElse(0.0);
     } else {
@@ -436,7 +541,7 @@ public final class CustomItemListener implements Listener {
     if (armorPenetration > 0.0) {
       damage += damage * armorPenetration;
     }
-    if (rollCritical(attributes)) {
+    if (rollCritical(attributes) || isVanillaCritical(attacker)) {
       double critMulti = itemService.doubleValue(attributes, "critical_damage_multiplier")
           .orElse(1.5);
       damage *= critMulti;
@@ -461,8 +566,12 @@ public final class CustomItemListener implements Listener {
       });
       itemService.intValue(attributes, "burn_target").ifPresent(seconds -> target.setFireTicks(
           seconds * 20));
-      itemService.intValue(attributes, "freeze_target")
-          .ifPresent(seconds -> target.setFreezeTicks(seconds * 20));
+      itemService.intValue(attributes, "freeze_target").ifPresent(seconds -> {
+        int freezeTicks = Math.max(target.getFreezeTicks(), seconds * 140);
+        target.setFreezeTicks(freezeTicks);
+        target.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, seconds * 20, 1, true,
+            true, true));
+      });
       itemService.intValue(attributes, "poison_target")
           .ifPresent(seconds -> target.addPotionEffect(new PotionEffect(PotionEffectType.POISON,
               seconds * 20, 0, true, true, true)));
@@ -544,8 +653,10 @@ public final class CustomItemListener implements Listener {
         for (int z = -radius; z <= radius && highlighted < 48; z++) {
           Block block = base.getBlock().getRelative(x, y, z);
           if (isValuable(block.getType())) {
-            player.spawnParticle(Particle.END_ROD, block.getLocation().add(0.5, 0.5, 0.5), 1,
-                0.0, 0.0, 0.0, 0.0);
+            Location center = block.getLocation().add(0.5, 0.5, 0.5);
+            player.spawnParticle(Particle.END_ROD, center, 8, 0.25, 0.25, 0.25, 0.0);
+            player.spawnParticle(Particle.ELECTRIC_SPARK, center.clone().add(0, 0.3, 0), 12, 0.35,
+                0.25, 0.35, 0.02);
             highlighted++;
           }
         }
@@ -572,6 +683,8 @@ public final class CustomItemListener implements Listener {
     boolean xpMagnet = itemService.boolValue(attributes, "xp_magnet");
     double radius = itemService.doubleValue(attributes, "item_vacuum_radius")
         .orElse(plugin.getConfig().getDouble("default-item-vacuum-radius", 6.0));
+    double pullStrength = itemService.doubleValue(attributes, "item_vacuum_pull_radius")
+        .orElse(plugin.getConfig().getDouble("default-item-vacuum-pull-radius", 0.28));
     if (!magnetMode && !autoPickup && !xpMagnet) {
       return;
     }
@@ -584,13 +697,13 @@ public final class CustomItemListener implements Listener {
           }
         } else if (magnetMode) {
           Vector velocity = player.getLocation().toVector().subtract(item.getLocation().toVector())
-              .multiply(0.18);
+              .normalize().multiply(pullStrength);
           item.setVelocity(velocity);
         }
       }
       if (xpMagnet && entity instanceof ExperienceOrb orb) {
         Vector velocity = player.getLocation().toVector().subtract(orb.getLocation().toVector())
-            .multiply(0.2);
+            .normalize().multiply(pullStrength + 0.04);
         orb.setVelocity(velocity);
       }
     }
@@ -620,6 +733,13 @@ public final class CustomItemListener implements Listener {
     }
   }
 
+  private BlockFace horizontalFacing(BlockFace facing) {
+    return switch (facing) {
+      case NORTH, SOUTH, EAST, WEST -> facing;
+      default -> BlockFace.NORTH;
+    };
+  }
+
   private void applyTillRadius(Player player, Block clicked, Map<String, String> attributes) {
     int radius = itemService.intValue(attributes, "till_radius").orElse(0);
     if (radius <= 0) {
@@ -644,6 +764,7 @@ public final class CustomItemListener implements Listener {
   private void applyPlacementRadius(
       Player player,
       Block clicked,
+      BlockFace clickedFace,
       ItemStack held,
       Map<String, String> attributes) {
     String placement = attributes.get("block_placement_radius");
@@ -657,19 +778,26 @@ public final class CustomItemListener implements Listener {
     String[] split = placement.toLowerCase(Locale.ROOT).split(":");
     String mode = split[0];
     int value = split.length >= 2 ? safeParseInt(split[1], 3) : 3;
-    Location origin = clicked.getLocation().add(0, 1, 0);
+    BlockFace face = clickedFace == null ? BlockFace.UP : clickedFace;
+    Block origin = clicked.getRelative(face);
     if (mode.equals("line")) {
-      Vector direction = player.getLocation().getDirection().setY(0).normalize();
-      for (int i = 1; i <= value; i++) {
-        Block target = origin.clone().add(direction.clone().multiply(i)).getBlock();
+      BlockFace direction = face == BlockFace.UP || face == BlockFace.DOWN
+          ? horizontalFacing(player.getFacing())
+          : face;
+      for (int i = 0; i < value; i++) {
+        Block target = origin.getRelative(direction, i);
         if (target.getType() == Material.AIR) {
           target.setType(placeMaterial);
         }
       }
     } else if (mode.equals("wall")) {
+      BlockFace facing = horizontalFacing(player.getFacing());
+      int width = Math.max(1, value);
       for (int y = 0; y < value; y++) {
-        for (int x = -value; x <= value; x++) {
-          Block target = origin.getBlock().getRelative(x, y, 0);
+        for (int offset = -width; offset <= width; offset++) {
+          Block target = facing == BlockFace.NORTH || facing == BlockFace.SOUTH
+              ? origin.getRelative(offset, y, 0)
+              : origin.getRelative(0, y, offset);
           if (target.getType() == Material.AIR) {
             target.setType(placeMaterial);
           }
@@ -679,7 +807,7 @@ public final class CustomItemListener implements Listener {
       int radius = Math.max(1, value / 2);
       for (int x = -radius; x <= radius; x++) {
         for (int z = -radius; z <= radius; z++) {
-          Block target = origin.getBlock().getRelative(x, 0, z);
+          Block target = origin.getRelative(x, 0, z);
           if (target.getType() == Material.AIR) {
             target.setType(placeMaterial);
           }
@@ -721,7 +849,7 @@ public final class CustomItemListener implements Listener {
   private Set<Block> collectExtraBlocks(Block origin, Player player, Map<String, String> attributes) {
     if (itemService.boolValue(attributes, "vein_mining") && isOreBlock(origin.getType())) {
       int max = plugin.getConfig().getInt("max-vein-size", 96);
-      return collectConnected(origin, origin.getType(), max);
+      return collectConnected(origin, max);
     }
     if (itemService.boolValue(attributes, "tree_feller") && origin.getType().name().endsWith("_LOG")) {
       return collectTree(origin, 196);
@@ -778,9 +906,10 @@ public final class CustomItemListener implements Listener {
     return blocks;
   }
 
-  private Set<Block> collectConnected(Block origin, Material type, int max) {
+  private Set<Block> collectConnected(Block origin, int max) {
     Set<Block> found = new HashSet<>();
     ArrayDeque<Block> queue = new ArrayDeque<>();
+    String family = oreFamily(origin.getType());
     queue.add(origin);
     while (!queue.isEmpty() && found.size() < max) {
       Block current = queue.poll();
@@ -791,7 +920,7 @@ public final class CustomItemListener implements Listener {
         for (int y = -1; y <= 1; y++) {
           for (int z = -1; z <= 1; z++) {
             Block relative = current.getRelative(x, y, z);
-            if (relative.getType() == type
+            if (isMatchingOreFamily(relative.getType(), family)
                 && !isUnbreakableBlock(relative.getType())
                 && !found.contains(relative)) {
               queue.add(relative);
@@ -801,6 +930,18 @@ public final class CustomItemListener implements Listener {
       }
     }
     return found;
+  }
+
+  private boolean isMatchingOreFamily(Material material, String family) {
+    return isOreBlock(material) && oreFamily(material).equals(family);
+  }
+
+  private String oreFamily(Material material) {
+    String name = material.name();
+    if (name.startsWith("DEEPSLATE_")) {
+      return name.substring("DEEPSLATE_".length());
+    }
+    return name;
   }
 
   private Set<Block> collectTree(Block origin, int max) {
@@ -847,6 +988,23 @@ public final class CustomItemListener implements Listener {
       return false;
     }
     return ageable.getAge() >= ageable.getMaximumAge();
+  }
+
+  private void scheduleCropReplant(Block broken, Material cropType) {
+    if (!(cropType.createBlockData() instanceof Ageable)) {
+      return;
+    }
+    Bukkit.getScheduler().runTask(plugin, () -> {
+      Block target = broken.getLocation().getBlock();
+      if (target.getType() != Material.AIR) {
+        return;
+      }
+      target.setType(cropType);
+      if (target.getBlockData() instanceof Ageable replanted) {
+        replanted.setAge(0);
+        target.setBlockData(replanted);
+      }
+    });
   }
 
   private int[] parseVolume(String input) {
@@ -1079,6 +1237,14 @@ public final class CustomItemListener implements Listener {
     return Math.random() <= chance;
   }
 
+  private boolean isVanillaCritical(Player player) {
+    return player.getFallDistance() > 0.0f
+        && !player.isOnGround()
+        && !player.isSprinting()
+        && !player.isInsideVehicle()
+        && !player.hasPotionEffect(PotionEffectType.BLINDNESS);
+  }
+
   private boolean passesBlockLists(Block block, Map<String, String> attributes) {
     if (isUnbreakableBlock(block.getType())) {
       return false;
@@ -1133,6 +1299,49 @@ public final class CustomItemListener implements Listener {
       }
     }
     return materials;
+  }
+
+  private boolean isPluginManagedItem(ItemStack stack) {
+    return stack != null
+        && stack.getType() != Material.AIR
+        && itemService.customItemId(stack).isPresent();
+  }
+
+  private boolean inventoryHasPluginItem(Inventory inventory, int... slots) {
+    for (int slot : slots) {
+      if (isPluginManagedItem(inventory.getItem(slot))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private boolean isProtectedModificationClick(InventoryClickEvent event) {
+    Inventory topInventory = event.getView().getTopInventory();
+    InventoryType type = topInventory.getType();
+    if (type != InventoryType.ANVIL
+        && type != InventoryType.GRINDSTONE
+        && type != InventoryType.ENCHANTING
+        && type != InventoryType.SMITHING) {
+      return false;
+    }
+    if (event.isShiftClick() && isPluginManagedItem(event.getCurrentItem())) {
+      return true;
+    }
+    Inventory clicked = event.getClickedInventory();
+    if (clicked != null && clicked.equals(topInventory)) {
+      if (isPluginManagedItem(event.getCursor())) {
+        return true;
+      }
+      int hotbar = event.getHotbarButton();
+      if (hotbar >= 0 && hotbar < event.getWhoClicked().getInventory().getSize()) {
+        ItemStack hotbarItem = event.getWhoClicked().getInventory().getItem(hotbar);
+        if (isPluginManagedItem(hotbarItem)) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   private Player resolveAttacker(Entity damager) {

@@ -5,8 +5,22 @@ default-cooldown-ms: 1250
 max-vein-size: 96
 default-break-radius: 0
 default-item-vacuum-radius: 6
+default-item-vacuum-pull-radius: 0.28
 mob-detection-radius: 22
 sell-container:
+  provider: auto
+  provider-order:
+    - EconomyShopGUI
+    - ShopGUIPlus
+    - QuickShop
+    - ChestShop
+    - Shopkeepers
+    - BossShopPro
+    - UltimateShop
+    - DynamicShop
+    - EssentialsX
+    - GUIShop
+    - Vault
   fallback-worth:
     COBBLESTONE: 0.2
     COAL: 1.5

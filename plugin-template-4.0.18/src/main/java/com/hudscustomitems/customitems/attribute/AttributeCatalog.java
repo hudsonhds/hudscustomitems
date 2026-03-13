@@ -139,6 +139,8 @@ public final class AttributeCatalog {
         "Pulls xp orbs toward player.");
     register("item_vacuum_radius", "Item Vacuum Radius", AttributeCategory.UTILITY,
         AttributeValueType.DECIMAL, "Pickup attraction range.");
+    register("item_vacuum_pull_radius", "Item Vacuum Pull Radius", AttributeCategory.UTILITY,
+        AttributeValueType.DECIMAL, "Pull strength toward the player.");
     register("block_highlighting", "Block Highlighting", AttributeCategory.UTILITY,
         AttributeValueType.BOOLEAN, "Highlights valuable blocks nearby.");
     register("mob_detection", "Mob Detection", AttributeCategory.UTILITY,
@@ -150,6 +152,8 @@ public final class AttributeCatalog {
         AttributeValueType.INTEGER, "Uses consumed per action.");
     register("durability_regen", "Durability Regen", AttributeCategory.DURABILITY,
         AttributeValueType.DECIMAL, "Uses restored per second.");
+    register("unbreakable", "Unbreakable", AttributeCategory.DURABILITY,
+        AttributeValueType.BOOLEAN, "Marks item unbreakable and preserves vanilla durability.");
     register("unbreakable_mode", "Unbreakable Mode", AttributeCategory.DURABILITY,
         AttributeValueType.BOOLEAN, "Prevents usage loss.");
     register("repair_material", "Repair Material", AttributeCategory.DURABILITY,
@@ -185,6 +189,8 @@ public final class AttributeCatalog {
         AttributeValueType.TEXT, "Lore lines split with |.");
     register("animated_lore", "Animated Lore", AttributeCategory.VISUAL, AttributeValueType.TEXT,
         "Animated lore states split with |.");
+    register("enchantments", "Enchantments", AttributeCategory.SPECIAL, AttributeValueType.TEXT,
+        "Comma list like sharpness:255,unbreaking:255 with max level 255.");
 
     register("right_click_ability", "Right Click Ability", AttributeCategory.SPECIAL,
         AttributeValueType.TEXT, "Named ability action for right click.");

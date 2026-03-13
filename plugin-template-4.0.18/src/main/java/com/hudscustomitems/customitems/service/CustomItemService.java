@@ -8,10 +8,12 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
@@ -19,12 +21,17 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextColor;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
+import org.bukkit.attribute.Attribute;
+import org.bukkit.attribute.AttributeModifier;
 import org.bukkit.ChatColor;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
+import org.bukkit.Registry;
 import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
+import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.inventory.meta.Damageable;
@@ -37,6 +44,12 @@ import org.bukkit.plugin.java.JavaPlugin;
  * Core service responsible for item definitions, lore generation and runtime attribute access.
  */
 public final class CustomItemService {
+  private static final int maxCustomEnchantLevel = 255;
+  private static final String oneOffId = "oneoff";
+  private static final UUID attackDamageModifierUuid =
+      UUID.fromString("ee564ce5-e5c4-4548-b95e-0b0e41ea72dd");
+  private static final UUID attackSpeedModifierUuid =
+      UUID.fromString("501de60f-0ec5-4633-bf8e-8a74f27f9da1");
   private final JavaPlugin plugin;
   private final ItemStorage itemStorage;
   private final LegacyComponentSerializer legacySerializer;
@@ -48,6 +61,7 @@ public final class CustomItemService {
   private final NamespacedKey ownerUuidKey;
   private final NamespacedKey usesLeftKey;
   private final NamespacedKey energyLeftKey;
+  private final NamespacedKey managedEnchantmentsKey;
 
   /**
    * Creates a new service instance.
@@ -66,6 +80,7 @@ public final class CustomItemService {
     this.ownerUuidKey = new NamespacedKey(plugin, "owner_uuid");
     this.usesLeftKey = new NamespacedKey(plugin, "uses_left");
     this.energyLeftKey = new NamespacedKey(plugin, "energy_left");
+    this.managedEnchantmentsKey = new NamespacedKey(plugin, "managed_enchantments");
     reloadDefinitions();
   }
 
@@ -220,9 +235,9 @@ public final class CustomItemService {
       return Optional.of("Unknown attribute id.");
     }
     AttributeDefinition known = attributeDefinition.get();
-    if (!known.valueType().isValid(value)) {
-      return Optional.of("Invalid value for type " + known.valueType().name()
-          + ". Example: " + known.valueType().example());
+    Optional<String> validation = validateAttributeValue(normalizedAttribute, known, value);
+    if (validation.isPresent()) {
+      return validation;
     }
     definition.attributes().put(normalizedAttribute, value);
     saveDefinitions();
@@ -270,7 +285,9 @@ public final class CustomItemService {
     Map<String, String> attributes = definition.attributes();
     meta.displayName(buildDisplayName(definition, attributes));
     List<Component> lore = new ArrayList<>();
-    lore.add(Component.text("ID: " + definition.id(), NamedTextColor.DARK_GRAY));
+    if (!definition.id().equals(oneOffId)) {
+      lore.add(Component.text("ID: " + definition.id(), NamedTextColor.DARK_GRAY));
+    }
     for (String line : definition.lore()) {
       lore.add(legacySerializer.deserialize(line));
     }
@@ -294,13 +311,15 @@ public final class CustomItemService {
       container.set(energyLeftKey, PersistentDataType.INTEGER,
           intValue(attributes, "energy_system").orElse(0));
     }
-    if (boolValue(attributes, "unbreakable_mode")) {
+    if (isMarkedUnbreakable(attributes)) {
       meta.setUnbreakable(true);
     }
     intValue(attributes, "custom_model_data").ifPresent(meta::setCustomModelData);
     if (boolValue(attributes, "glow_effect")) {
       meta.setEnchantmentGlintOverride(true);
     }
+    applyManagedEnchantments(meta, attributes);
+    applyCombatAttributeModifiers(meta, attributes);
     stack.setItemMeta(meta);
     return Optional.of(stack);
   }
@@ -366,8 +385,12 @@ public final class CustomItemService {
     if (knownAttribute.isEmpty()) {
       return Optional.of("Unknown attribute id.");
     }
-    if (!knownAttribute.get().valueType().isValid(value)) {
-      return Optional.of("Invalid value for " + normalizedAttribute + ".");
+    Optional<String> validation = validateAttributeValue(
+        normalizedAttribute,
+        knownAttribute.get(),
+        value);
+    if (validation.isPresent()) {
+      return validation;
     }
     Map<String, String> oneTime = new LinkedHashMap<>(readOneTimeAttributes(stack));
     oneTime.put(normalizedAttribute, value);
@@ -516,7 +539,7 @@ public final class CustomItemService {
    */
   public boolean consumeUse(Player player, ItemStack stack) {
     Map<String, String> attributes = resolveAttributes(stack);
-    if (attributes.isEmpty() || boolValue(attributes, "unbreakable_mode")) {
+    if (attributes.isEmpty() || isMarkedUnbreakable(attributes)) {
       return true;
     }
     int cost = Math.max(1, intValue(attributes, "durability_cost_per_use").orElse(1));
@@ -641,6 +664,10 @@ public final class CustomItemService {
     if (existingMeta == null) {
       return false;
     }
+    Integer vanillaDamage = null;
+    if (existingMeta instanceof Damageable existingDamageable) {
+      vanillaDamage = existingDamageable.getDamage();
+    }
     Integer uses = existingMeta.getPersistentDataContainer()
         .get(usesLeftKey, PersistentDataType.INTEGER);
     Integer energy = existingMeta.getPersistentDataContainer()
@@ -673,9 +700,24 @@ public final class CustomItemService {
       dataContainer.set(oneTimeAttributesKey, PersistentDataType.STRING, oneTime);
     }
     rebuilt.setItemMeta(rebuiltMeta);
+    if (oneTime != null && !oneTime.isBlank()) {
+      refreshRuntimeLore(rebuilt);
+    }
     stack.setType(rebuilt.getType());
     stack.setAmount(rebuilt.getAmount());
-    stack.setItemMeta(rebuilt.getItemMeta());
+    ItemMeta finalMeta = rebuilt.getItemMeta();
+    if (finalMeta == null) {
+      return false;
+    }
+    Map<String, String> rebuiltAttributes = resolveAttributes(rebuilt);
+    if (finalMeta instanceof Damageable finalDamageable) {
+      int preservedDamage = clampDamage(
+          vanillaDamage,
+          rebuilt.getType().getMaxDurability(),
+          isMarkedUnbreakable(rebuiltAttributes));
+      finalDamageable.setDamage(preservedDamage);
+    }
+    stack.setItemMeta(finalMeta);
     return true;
   }
 
@@ -717,6 +759,19 @@ public final class CustomItemService {
         || normalized.equals("1");
   }
 
+  private boolean isMarkedUnbreakable(Map<String, String> attributes) {
+    return boolValue(attributes, "unbreakable_mode")
+        || boolValue(attributes, "unbreakable");
+  }
+
+  private int clampDamage(Integer rawDamage, int maxDurability, boolean unbreakable) {
+    if (unbreakable || rawDamage == null) {
+      return 0;
+    }
+    int upperBound = Math.max(0, maxDurability);
+    return Math.max(0, Math.min(rawDamage, upperBound));
+  }
+
   /**
    * Parses integer attribute from resolved map.
    *
@@ -753,6 +808,23 @@ public final class CustomItemService {
     } catch (NumberFormatException ex) {
       return Optional.empty();
     }
+  }
+
+  private Optional<String> validateAttributeValue(
+      String attributeId,
+      AttributeDefinition definition,
+      String value) {
+    if (!definition.valueType().isValid(value)) {
+      return Optional.of("Invalid value for type " + definition.valueType().name()
+          + ". Example: " + definition.valueType().example());
+    }
+    if (!attributeId.equals("enchantments")) {
+      return Optional.empty();
+    }
+    EnchantmentParseResult parsed = parseEnchantments(value, true);
+    return parsed.errorMessage() == null
+        ? Optional.empty()
+        : Optional.of(parsed.errorMessage());
   }
 
   private boolean passesCooldown(
@@ -877,7 +949,9 @@ public final class CustomItemService {
     }
     Map<String, String> mergedAttributes = resolveAttributes(stack);
     List<Component> lore = new ArrayList<>();
-    lore.add(Component.text("ID: " + id.get(), NamedTextColor.DARK_GRAY));
+    if (!id.get().equals(oneOffId)) {
+      lore.add(Component.text("ID: " + id.get(), NamedTextColor.DARK_GRAY));
+    }
     if (definition != null) {
       for (String line : definition.lore()) {
         lore.add(legacySerializer.deserialize(line));
@@ -886,6 +960,8 @@ public final class CustomItemService {
     addCustomLoreAttributes(mergedAttributes, lore);
     addRuntimeLore(mergedAttributes, meta.getPersistentDataContainer(), lore);
     meta.lore(lore);
+    applyManagedEnchantments(meta, mergedAttributes);
+    applyCombatAttributeModifiers(meta, mergedAttributes);
     stack.setItemMeta(meta);
   }
 
@@ -893,7 +969,7 @@ public final class CustomItemService {
     updateMeta(stack, meta -> {
       PersistentDataContainer container = meta.getPersistentDataContainer();
       if (!container.has(itemIdKey, PersistentDataType.STRING)) {
-        container.set(itemIdKey, PersistentDataType.STRING, "oneoff");
+        container.set(itemIdKey, PersistentDataType.STRING, oneOffId);
       }
     });
   }
@@ -927,6 +1003,7 @@ public final class CustomItemService {
       Map<String, String> attributes,
       PersistentDataContainer dataContainer,
       List<Component> lore) {
+    lore.add(Component.text("Unmodifiable", NamedTextColor.RED));
     int maxUses = intValue(attributes, "durability")
         .orElse(intValue(attributes, "limited_uses").orElse(0));
     if (maxUses > 0) {
@@ -1075,14 +1152,183 @@ public final class CustomItemService {
     return output.toString();
   }
 
+  private void applyCombatAttributeModifiers(ItemMeta meta, Map<String, String> attributes) {
+    meta.removeAttributeModifier(Attribute.ATTACK_DAMAGE);
+    meta.removeAttributeModifier(Attribute.ATTACK_SPEED);
+    doubleValue(attributes, "attack_damage").ifPresent(value -> {
+      if (Math.abs(value) < 0.0000001) {
+        return;
+      }
+      AttributeModifier modifier = new AttributeModifier(
+          attackDamageModifierUuid,
+          "customitems_attack_damage",
+          value,
+          AttributeModifier.Operation.ADD_NUMBER,
+          EquipmentSlot.HAND);
+      meta.addAttributeModifier(Attribute.ATTACK_DAMAGE, modifier);
+    });
+    doubleValue(attributes, "attack_speed").ifPresent(value -> {
+      if (Math.abs(value) < 0.0000001) {
+        return;
+      }
+      AttributeModifier modifier = new AttributeModifier(
+          attackSpeedModifierUuid,
+          "customitems_attack_speed",
+          value,
+          AttributeModifier.Operation.ADD_NUMBER,
+          EquipmentSlot.HAND);
+      meta.addAttributeModifier(Attribute.ATTACK_SPEED, modifier);
+    });
+  }
+
+  private void applyManagedEnchantments(ItemMeta meta, Map<String, String> attributes) {
+    EnchantmentParseResult desiredParse = parseEnchantments(attributes.get("enchantments"), false);
+    Map<Enchantment, Integer> desired = desiredParse.values();
+    PersistentDataContainer container = meta.getPersistentDataContainer();
+    Set<String> previousKeys = readManagedEnchantmentKeys(container);
+    Set<String> desiredKeys = new LinkedHashSet<>();
+    for (Enchantment enchantment : desired.keySet()) {
+      String key = enchantment.getKey().toString().toLowerCase(Locale.ROOT);
+      desiredKeys.add(key);
+    }
+    for (String previousKey : previousKeys) {
+      if (desiredKeys.contains(previousKey)) {
+        continue;
+      }
+      Enchantment enchantment = resolveEnchantment(previousKey);
+      if (enchantment != null) {
+        meta.removeEnchant(enchantment);
+      }
+    }
+    for (Map.Entry<Enchantment, Integer> entry : desired.entrySet()) {
+      meta.addEnchant(entry.getKey(), entry.getValue(), true);
+    }
+    writeManagedEnchantmentKeys(container, desiredKeys);
+  }
+
+  private Set<String> readManagedEnchantmentKeys(PersistentDataContainer container) {
+    String serialized = container.get(managedEnchantmentsKey, PersistentDataType.STRING);
+    if (serialized == null || serialized.isBlank()) {
+      return Set.of();
+    }
+    Set<String> keys = new LinkedHashSet<>();
+    for (String split : serialized.split(",")) {
+      String key = split.trim().toLowerCase(Locale.ROOT);
+      if (!key.isBlank()) {
+        keys.add(key);
+      }
+    }
+    return keys;
+  }
+
+  private void writeManagedEnchantmentKeys(
+      PersistentDataContainer container,
+      Set<String> enchantmentKeys) {
+    if (enchantmentKeys.isEmpty()) {
+      container.remove(managedEnchantmentsKey);
+      return;
+    }
+    String serialized = enchantmentKeys.stream().collect(Collectors.joining(","));
+    container.set(managedEnchantmentsKey, PersistentDataType.STRING, serialized);
+  }
+
+  private EnchantmentParseResult parseEnchantments(String value, boolean strict) {
+    Map<Enchantment, Integer> parsed = new LinkedHashMap<>();
+    if (value == null || value.isBlank()) {
+      return strict
+          ? new EnchantmentParseResult(parsed, "Enchantments list cannot be empty.")
+          : new EnchantmentParseResult(parsed, null);
+    }
+    for (String rawEntry : value.split(",")) {
+      String entry = rawEntry.trim();
+      if (entry.isBlank()) {
+        if (strict) {
+          return new EnchantmentParseResult(parsed, "Enchantment entries cannot be empty.");
+        }
+        continue;
+      }
+      int separator = Math.max(entry.lastIndexOf(':'), entry.lastIndexOf('='));
+      if (separator <= 0 || separator >= entry.length() - 1) {
+        if (strict) {
+          return new EnchantmentParseResult(parsed,
+              "Use enchantments as enchant:level, e.g. sharpness:255.");
+        }
+        continue;
+      }
+      String enchantmentName = entry.substring(0, separator).trim();
+      String levelText = entry.substring(separator + 1).trim();
+      if (enchantmentName.isBlank() || levelText.isBlank()) {
+        if (strict) {
+          return new EnchantmentParseResult(parsed,
+              "Use enchantments as enchant:level, e.g. sharpness:255.");
+        }
+        continue;
+      }
+      int level;
+      try {
+        level = Integer.parseInt(levelText);
+      } catch (NumberFormatException ex) {
+        if (strict) {
+          return new EnchantmentParseResult(parsed,
+              "Enchantment level for '" + enchantmentName + "' must be a whole number.");
+        }
+        continue;
+      }
+      if (level < 1 || level > maxCustomEnchantLevel) {
+        if (strict) {
+          return new EnchantmentParseResult(parsed,
+              "Enchantment level for '" + enchantmentName + "' must be between 1 and "
+                  + maxCustomEnchantLevel + ".");
+        }
+        level = Math.max(1, Math.min(maxCustomEnchantLevel, level));
+      }
+      Enchantment enchantment = resolveEnchantment(enchantmentName);
+      if (enchantment == null) {
+        if (strict) {
+          return new EnchantmentParseResult(parsed,
+              "Unknown enchantment '" + enchantmentName + "'.");
+        }
+        continue;
+      }
+      parsed.put(enchantment, level);
+    }
+    if (strict && parsed.isEmpty()) {
+      return new EnchantmentParseResult(parsed, "Enchantments list cannot be empty.");
+    }
+    return new EnchantmentParseResult(parsed, null);
+  }
+
+  private Enchantment resolveEnchantment(String value) {
+    String normalized = value.trim().toLowerCase(Locale.ROOT);
+    if (normalized.isBlank()) {
+      return null;
+    }
+    NamespacedKey key = normalized.contains(":")
+        ? NamespacedKey.fromString(normalized)
+        : NamespacedKey.minecraft(normalized);
+    if (key != null) {
+      Enchantment byKey = Registry.ENCHANTMENT.get(key);
+      if (byKey != null) {
+        return byKey;
+      }
+    }
+    for (Enchantment enchantment : Registry.ENCHANTMENT) {
+      NamespacedKey enchantmentKey = enchantment.getKey();
+      if (enchantmentKey.getKey().equalsIgnoreCase(normalized)
+          || enchantmentKey.toString().equalsIgnoreCase(normalized)) {
+        return enchantment;
+      }
+    }
+    return null;
+  }
+
   private void updateMeta(ItemStack stack, java.util.function.Consumer<ItemMeta> updater) {
     ItemMeta meta = stack.getItemMeta();
     if (meta == null) {
       return;
     }
     updater.accept(meta);
-    if (meta instanceof Damageable damageable && boolValue(resolveAttributes(stack),
-        "unbreakable_mode")) {
+    if (meta instanceof Damageable damageable && isMarkedUnbreakable(resolveAttributes(stack))) {
       damageable.setDamage(0);
     }
     stack.setItemMeta(meta);
@@ -1094,5 +1340,10 @@ public final class CustomItemService {
 
   private String color(String text) {
     return ChatColor.translateAlternateColorCodes('&', text);
+  }
+
+  private record EnchantmentParseResult(
+      Map<Enchantment, Integer> values,
+      String errorMessage) {
   }
 }

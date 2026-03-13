@@ -129,7 +129,7 @@ public final class SellContainerService {
   }
 
   private Optional<PriceQuote> quoteSellValue(Player player, ItemStack stack) {
-    for (SellPriceProvider provider : priceProviders) {
+    for (SellPriceProvider provider : configuredPriceProviders()) {
       if (!provider.available()) {
         continue;
       }
@@ -200,6 +200,39 @@ public final class SellContainerService {
         List.of("getSellPrice", "getPrice", "getWorth")));
     chain.add(new ConfigWorthProvider(plugin, "Vault"));
     return chain;
+  }
+
+  private List<SellPriceProvider> configuredPriceProviders() {
+    String forcedProvider = plugin.getConfig().getString("sell-container.provider", "auto");
+    if (forcedProvider != null
+        && !forcedProvider.isBlank()
+        && !forcedProvider.equalsIgnoreCase("auto")) {
+      List<SellPriceProvider> single = new ArrayList<>();
+      for (SellPriceProvider provider : priceProviders) {
+        if (provider.name().equalsIgnoreCase(forcedProvider.trim())) {
+          single.add(provider);
+          return single;
+        }
+      }
+      return List.of();
+    }
+    List<String> configuredOrder = plugin.getConfig().getStringList("sell-container.provider-order");
+    if (configuredOrder.isEmpty()) {
+      return priceProviders;
+    }
+    Map<String, SellPriceProvider> byName = new LinkedHashMap<>();
+    for (SellPriceProvider provider : priceProviders) {
+      byName.put(provider.name().toLowerCase(Locale.ROOT), provider);
+    }
+    List<SellPriceProvider> ordered = new ArrayList<>();
+    for (String providerName : configuredOrder) {
+      SellPriceProvider matched = byName.remove(providerName.toLowerCase(Locale.ROOT).trim());
+      if (matched != null) {
+        ordered.add(matched);
+      }
+    }
+    ordered.addAll(byName.values());
+    return ordered;
   }
 
   private record SoldStack(int slot, int amount, double stackValue, String providerName) {

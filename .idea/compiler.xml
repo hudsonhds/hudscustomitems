@@ -5,6 +5,7 @@
       <module name="ExamplePlugin" target="21" />
       <module name="ExamplePlugin.main" target="21" />
       <module name="ExamplePlugin.test" target="21" />
+      <module name="HudsCustomItems" target="21" />
     </bytecodeTargetLevel>
   </component>
 </project>

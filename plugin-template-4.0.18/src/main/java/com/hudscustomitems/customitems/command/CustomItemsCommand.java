@@ -536,6 +536,11 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
           "burst",
           "projectile",
           "block");
+      case "enchantments" -> List.of(
+          "sharpness:255",
+          "efficiency:255",
+          "unbreaking:255",
+          "sharpness:255,unbreaking:255");
       case "custom_lore_lines", "animated_lore" -> List.of(
           "&7Line 1|&eLine 2",
           "&aFrame 1|&bFrame 2|&dFrame 3");
