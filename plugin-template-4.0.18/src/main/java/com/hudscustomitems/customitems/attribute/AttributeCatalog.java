@@ -127,8 +127,8 @@ public final class AttributeCatalog {
         AttributeValueType.DECIMAL, "Teleports forward by configured distance.");
     register("dash_ability", "Dash Ability", AttributeCategory.UTILITY,
         AttributeValueType.DECIMAL, "Applies a forward dash.");
-    register("double_jump", "Double Jump", AttributeCategory.UTILITY, AttributeValueType.BOOLEAN,
-        "Allows a second jump in air.");
+    register("double_jump", "Double Jump", AttributeCategory.UTILITY, AttributeValueType.INTEGER,
+        "Second-jump power percent (100 = normal).");
     register("glide_mode", "Glide Mode", AttributeCategory.UTILITY, AttributeValueType.BOOLEAN,
         "Slows falling while holding item.");
     register("magnet_mode", "Magnet Mode", AttributeCategory.UTILITY, AttributeValueType.BOOLEAN,

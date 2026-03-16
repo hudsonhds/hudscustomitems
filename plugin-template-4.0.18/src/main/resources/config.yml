@@ -1,3 +1,4 @@
+config-version: 2
 permission-node: customitems.admin
 use-permission-node: customitems.use
 send-ability-messages: true
@@ -7,6 +8,35 @@ default-break-radius: 0
 default-item-vacuum-radius: 6
 default-item-vacuum-pull-radius: 0.28
 mob-detection-radius: 22
+attribute-display:
+  enabled: true
+  show-unmodifiable-tag: true
+  header:
+    enabled: true
+    line: "&7Attributes"
+  show-values-by-default: true
+  line-format: "&8- {color}{name}{value_part}"
+  default-colors:
+    TOOL_BLOCK: "&e"
+    COMBAT: "&c"
+    PLAYER_BUFF: "&a"
+    UTILITY: "&b"
+    DURABILITY: "&6"
+    VISUAL: "&d"
+    SPECIAL: "&5"
+    RESTRICTION: "&7"
+  attributes:
+    custom_name_color:
+      enabled: false
+    glow_effect:
+      enabled: false
+    # Example per-attribute override:
+    # jump_boost:
+    #   enabled: true
+    #   show-value: false
+    #   color: "&3"
+    #   display-name: "Jump Boost"
+    #   format: "&8- {color}{name}{value_part}"
 sell-container:
   provider: auto
   provider-order:

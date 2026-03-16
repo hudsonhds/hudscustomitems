@@ -2,6 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
+      <module fileurl="file://$PROJECT_DIR$/.idea/modules/HudsCustomItems.iml" filepath="$PROJECT_DIR$/.idea/modules/HudsCustomItems.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/modules/HudsCustomItems.main.iml" filepath="$PROJECT_DIR$/.idea/modules/HudsCustomItems.main.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/modules/HudsCustomItems.test.iml" filepath="$PROJECT_DIR$/.idea/modules/HudsCustomItems.test.iml" />
     </modules>

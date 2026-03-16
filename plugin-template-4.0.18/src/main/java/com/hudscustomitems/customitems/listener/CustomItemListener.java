@@ -51,6 +51,7 @@ import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerToggleFlightEvent;
 import org.bukkit.event.player.PlayerToggleSneakEvent;
 import org.bukkit.inventory.CookingRecipe;
@@ -69,6 +70,8 @@ import org.bukkit.util.Vector;
  * Handles gameplay behavior tied to custom item attributes.
  */
 public final class CustomItemListener implements Listener {
+  private static final int POTION_DURATION_TICKS = 15 * 20;
+  private static final long POTION_REFRESH_INTERVAL_MS = 5_000L;
   private final JavaPlugin plugin;
   private final CustomItemService itemService;
   private final SellContainerService sellContainerService;
@@ -77,6 +80,9 @@ public final class CustomItemListener implements Listener {
   private final Set<UUID> combatEffectGuard;
   private final Map<UUID, Integer> comboHits;
   private final Map<UUID, Long> movementThrottle;
+  private final Map<UUID, Long> dashTriggerTimes;
+  private final Map<UUID, Long> potionRefreshTimes;
+  private final Map<UUID, Set<PotionEffectType>> managedPotionEffects;
 
   /**
    * Creates listener with references needed for custom item runtime logic.
@@ -97,6 +103,9 @@ public final class CustomItemListener implements Listener {
     this.combatEffectGuard = new HashSet<>();
     this.comboHits = new HashMap<>();
     this.movementThrottle = new HashMap<>();
+    this.dashTriggerTimes = new HashMap<>();
+    this.potionRefreshTimes = new HashMap<>();
+    this.managedPotionEffects = new HashMap<>();
   }
 
   /**
@@ -105,17 +114,17 @@ public final class CustomItemListener implements Listener {
   public void runSecondTick() {
     for (Player player : Bukkit.getOnlinePlayers()) {
       itemService.synchronizeInventory(player);
+      applyPotionBuffs(player, resolvePotionAttributes(player));
+      updateDoubleJumpState(player, resolveMobilityAttributes(player));
       ItemStack held = player.getInventory().getItemInMainHand();
       if (itemService.customItemId(held).isEmpty()) {
         continue;
       }
       Map<String, String> attributes = itemService.resolveAttributes(held);
-      applyPotionBuffs(player, attributes);
       applyTrailParticles(player, attributes);
       applyBlockHighlighting(player, attributes);
       applyMobDetection(player, attributes);
       itemService.tickRegen(player);
-      updateDoubleJumpState(player, attributes);
       animateLoreIfNeeded(held, attributes);
     }
   }
@@ -264,15 +273,22 @@ public final class CustomItemListener implements Listener {
 
   @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
   public void onInteract(PlayerInteractEvent event) {
-    if (event.getHand() != EquipmentSlot.HAND) {
-      return;
-    }
     Action action = event.getAction();
     if (action != Action.RIGHT_CLICK_AIR && action != Action.RIGHT_CLICK_BLOCK) {
       return;
     }
     Player player = event.getPlayer();
     ItemStack held = player.getInventory().getItemInMainHand();
+    if (held.getType() == Material.AIR
+        && player.isSneaking()
+        && (event.getHand() == EquipmentSlot.HAND || event.getHand() == EquipmentSlot.OFF_HAND)
+        && triggerSneakDash(player)) {
+      event.setCancelled(true);
+      return;
+    }
+    if (event.getHand() != EquipmentSlot.HAND) {
+      return;
+    }
     if (itemService.customItemId(held).isEmpty()) {
       return;
     }
@@ -292,6 +308,25 @@ public final class CustomItemListener implements Listener {
     useRightClickAbilities(player, held, attributes);
     playUseSound(player, attributes);
     itemService.consumeUse(player, held);
+  }
+
+  @EventHandler(priority = EventPriority.LOWEST)
+  public void onSneakDashInteract(PlayerInteractEvent event) {
+    Action action = event.getAction();
+    if (action != Action.RIGHT_CLICK_AIR && action != Action.RIGHT_CLICK_BLOCK) {
+      return;
+    }
+    if (event.getHand() != EquipmentSlot.HAND && event.getHand() != EquipmentSlot.OFF_HAND) {
+      return;
+    }
+    Player player = event.getPlayer();
+    ItemStack held = player.getInventory().getItemInMainHand();
+    if (held.getType() != Material.AIR || !player.isSneaking()) {
+      return;
+    }
+    if (triggerSneakDash(player)) {
+      event.setCancelled(true);
+    }
   }
 
   @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
@@ -349,13 +384,14 @@ public final class CustomItemListener implements Listener {
   @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
   public void onMove(PlayerMoveEvent event) {
     Player player = event.getPlayer();
+    Map<String, String> mobilityAttributes = resolveMobilityAttributes(player);
+    applyGlide(player, mobilityAttributes);
+    updateDoubleJumpState(player, mobilityAttributes);
     ItemStack held = player.getInventory().getItemInMainHand();
     if (itemService.customItemId(held).isEmpty()) {
       return;
     }
     Map<String, String> attributes = itemService.resolveAttributes(held);
-    applyGlide(player, attributes);
-    updateDoubleJumpState(player, attributes);
     if (!isMovementTickDue(player)) {
       return;
     }
@@ -366,22 +402,28 @@ public final class CustomItemListener implements Listener {
   public void onToggleFlight(PlayerToggleFlightEvent event) {
     Player player = event.getPlayer();
     if (player.getAllowFlight() && !player.isFlying()) {
-      ItemStack held = player.getInventory().getItemInMainHand();
-      if (itemService.customItemId(held).isEmpty()) {
+      Optional<ItemWithAttributes> jumpSource = findDoubleJumpSource(player);
+      if (jumpSource.isEmpty()) {
         return;
       }
-      Map<String, String> attributes = itemService.resolveAttributes(held);
-      if (!itemService.boolValue(attributes, "double_jump")) {
+      ItemWithAttributes source = jumpSource.get();
+      if (!itemService.canUse(player, source.stack(), null, false)) {
+        return;
+      }
+      int jumpPercent = itemService.intValue(source.attributes(), "double_jump").orElse(0);
+      if (jumpPercent <= 0) {
         return;
       }
       event.setCancelled(true);
       player.setFlying(false);
       player.setAllowFlight(false);
-      Vector jump = player.getLocation().getDirection().multiply(0.7).setY(0.75);
+      double jumpMultiplier = jumpPercent / 100.0;
+      Vector jump = player.getLocation().getDirection().multiply(0.7 * jumpMultiplier)
+          .setY(0.75 * jumpMultiplier);
       player.setVelocity(player.getVelocity().add(jump));
       player.getWorld().spawnParticle(Particle.CLOUD, player.getLocation().add(0, 0.1, 0), 14, 0.3,
           0.2, 0.3, 0.01);
-      itemService.consumeUse(player, held);
+      itemService.consumeUse(player, source.stack());
     }
   }
 
@@ -491,16 +533,18 @@ public final class CustomItemListener implements Listener {
     Bukkit.getScheduler().runTask(plugin, () -> itemService.synchronizeInventory(event.getPlayer()));
   }
 
+  @EventHandler(priority = EventPriority.MONITOR)
+  public void onQuit(PlayerQuitEvent event) {
+    UUID playerId = event.getPlayer().getUniqueId();
+    dashTriggerTimes.remove(playerId);
+    potionRefreshTimes.remove(playerId);
+    managedPotionEffects.remove(playerId);
+  }
+
   private void useRightClickAbilities(Player player, ItemStack held, Map<String, String> attributes) {
     itemService.doubleValue(attributes, "teleport_on_right_click")
         .ifPresent(distance -> teleportForward(player, distance));
-    itemService.doubleValue(attributes, "dash_ability").ifPresent(strength -> {
-      Vector dash = player.getLocation().getDirection().normalize().multiply(strength);
-      dash.setY(Math.max(dash.getY(), 0.25));
-      player.setVelocity(dash);
-      player.getWorld().spawnParticle(Particle.CLOUD, player.getLocation().add(0, 0.2, 0), 18, 0.2,
-          0.1, 0.2, 0.01);
-    });
+    itemService.doubleValue(attributes, "dash_ability").ifPresent(strength -> applyDash(player, strength));
     if (itemService.boolValue(attributes, "projectile_launch")
         || attributes.containsKey("projectile_launch")) {
       launchConfiguredProjectile(player, attributes.get("projectile_launch"));
@@ -603,33 +647,230 @@ public final class CustomItemListener implements Listener {
   }
 
   private void applyPotionBuffs(Player player, Map<String, String> attributes) {
-    applyOptionalEffect(player, attributes, "speed_bonus", PotionEffectType.SPEED);
-    applyOptionalEffect(player, attributes, "jump_boost", PotionEffectType.JUMP_BOOST);
-    applyOptionalEffect(player, attributes, "haste", PotionEffectType.HASTE);
-    applyOptionalEffect(player, attributes, "strength_boost", PotionEffectType.STRENGTH);
-    applyOptionalEffect(player, attributes, "regeneration", PotionEffectType.REGENERATION);
+    UUID playerId = player.getUniqueId();
+    long now = System.currentTimeMillis();
+    boolean shouldRefresh = now - potionRefreshTimes.getOrDefault(playerId, 0L)
+        >= POTION_REFRESH_INTERVAL_MS;
+    if (shouldRefresh) {
+      potionRefreshTimes.put(playerId, now);
+    }
+    Set<PotionEffectType> desiredEffects = new HashSet<>();
+    applyOptionalEffect(player, attributes, "speed_bonus", PotionEffectType.SPEED, desiredEffects,
+        shouldRefresh);
+    applyOptionalEffect(player, attributes, "jump_boost", PotionEffectType.JUMP_BOOST, desiredEffects,
+        shouldRefresh);
+    applyOptionalEffect(player, attributes, "haste", PotionEffectType.HASTE, desiredEffects,
+        shouldRefresh);
+    applyOptionalEffect(player, attributes, "strength_boost", PotionEffectType.STRENGTH, desiredEffects,
+        shouldRefresh);
+    applyOptionalEffect(player, attributes, "regeneration", PotionEffectType.REGENERATION, desiredEffects,
+        shouldRefresh);
     if (itemService.boolValue(attributes, "night_vision")) {
-      player.addPotionEffect(new PotionEffect(PotionEffectType.NIGHT_VISION, 60, 0, true, false,
-          false));
+      applyManagedPotionEffect(player, PotionEffectType.NIGHT_VISION, 0, desiredEffects, shouldRefresh);
     }
     if (itemService.boolValue(attributes, "water_breathing")) {
-      player.addPotionEffect(new PotionEffect(PotionEffectType.WATER_BREATHING, 60, 0, true, false,
-          false));
+      applyManagedPotionEffect(player, PotionEffectType.WATER_BREATHING, 0, desiredEffects,
+          shouldRefresh);
     }
     if (itemService.boolValue(attributes, "fire_resistance")) {
-      player.addPotionEffect(new PotionEffect(PotionEffectType.FIRE_RESISTANCE, 60, 0, true,
-          false, false));
+      applyManagedPotionEffect(player, PotionEffectType.FIRE_RESISTANCE, 0, desiredEffects, shouldRefresh);
     }
     itemService.doubleValue(attributes, "health_bonus").ifPresent(healthBonus -> {
       int amplifier = Math.max(0, (int) Math.floor(healthBonus / 4.0));
-      player.addPotionEffect(new PotionEffect(PotionEffectType.HEALTH_BOOST, 60, amplifier, true,
-          false, false));
+      applyManagedPotionEffect(player, PotionEffectType.HEALTH_BOOST, amplifier, desiredEffects,
+          shouldRefresh);
     });
     itemService.doubleValue(attributes, "absorption_hearts").ifPresent(extra -> {
       int amplifier = Math.max(0, (int) Math.floor(extra / 4.0));
-      player.addPotionEffect(new PotionEffect(PotionEffectType.ABSORPTION, 60, amplifier, true,
-          false, false));
+      applyManagedPotionEffect(player, PotionEffectType.ABSORPTION, amplifier, desiredEffects,
+          shouldRefresh);
     });
+    removeStaleManagedPotionEffects(player, desiredEffects);
+  }
+
+  private boolean triggerSneakDash(Player player) {
+    long now = System.currentTimeMillis();
+    long lastTrigger = dashTriggerTimes.getOrDefault(player.getUniqueId(), 0L);
+    if (now - lastTrigger < 200L) {
+      return false;
+    }
+    Optional<ItemWithAttributes> dashSource = findDashAbilitySource(player);
+    if (dashSource.isEmpty()) {
+      return false;
+    }
+    ItemWithAttributes source = dashSource.get();
+    if (!itemService.canUse(player, source.stack(), null, false)) {
+      return false;
+    }
+    if (!itemService.canTriggerAction(player, source.stack(), "right_click", false)) {
+      return false;
+    }
+    dashTriggerTimes.put(player.getUniqueId(), now);
+    itemService.doubleValue(source.attributes(), "dash_ability").ifPresent(strength -> {
+      applyDash(player, strength);
+      playUseSound(player, source.attributes());
+      itemService.consumeUse(player, source.stack());
+    });
+    return true;
+  }
+
+  /**
+   * Protocol fallback entrypoint for sneak-right-click air with empty hand.
+   *
+   * @param player player to process
+   */
+  public void triggerSneakDashFallback(Player player) {
+    ItemStack mainHand = player.getInventory().getItemInMainHand();
+    if (mainHand.getType() != Material.AIR || !player.isSneaking()) {
+      return;
+    }
+    triggerSneakDash(player);
+  }
+
+  private Optional<ItemWithAttributes> findDoubleJumpSource(Player player) {
+    ItemWithAttributes best = null;
+    int bestPercent = 0;
+    for (ItemStack stack : resolveHeldAndEquippedCustomItems(player)) {
+      Map<String, String> attributes = itemService.resolveAttributes(stack);
+      int percent = itemService.intValue(attributes, "double_jump").orElse(0);
+      if (percent > bestPercent) {
+        bestPercent = percent;
+        best = new ItemWithAttributes(stack, attributes);
+      }
+    }
+    return Optional.ofNullable(best);
+  }
+
+  private Optional<ItemWithAttributes> findDashAbilitySource(Player player) {
+    ItemWithAttributes best = null;
+    double bestStrength = 0.0;
+    for (ItemStack stack : resolveHeldAndEquippedCustomItems(player)) {
+      Map<String, String> attributes = itemService.resolveAttributes(stack);
+      Optional<Double> strength = itemService.doubleValue(attributes, "dash_ability");
+      if (strength.isEmpty() || strength.get() <= bestStrength) {
+        continue;
+      }
+      bestStrength = strength.get();
+      best = new ItemWithAttributes(stack, attributes);
+    }
+    return Optional.ofNullable(best);
+  }
+
+  private Map<String, String> resolvePotionAttributes(Player player) {
+    Map<String, String> merged = new HashMap<>();
+    for (ItemStack stack : resolveHeldAndEquippedCustomItems(player)) {
+      mergePotionAttributes(merged, itemService.resolveAttributes(stack));
+    }
+    return merged;
+  }
+
+  private Map<String, String> resolveMobilityAttributes(Player player) {
+    Map<String, String> merged = new HashMap<>();
+    for (ItemStack stack : resolveHeldAndEquippedCustomItems(player)) {
+      Map<String, String> attributes = itemService.resolveAttributes(stack);
+      mergeMaxIntegerAttribute(merged, attributes, "double_jump");
+      mergeBooleanAttribute(merged, attributes, "glide_mode");
+    }
+    return merged;
+  }
+
+  private List<ItemStack> resolveHeldAndEquippedCustomItems(Player player) {
+    List<ItemStack> sources = new ArrayList<>();
+    addIfCustomItem(sources, player.getInventory().getItemInMainHand());
+    addIfCustomItem(sources, player.getInventory().getItemInOffHand());
+    for (ItemStack armorPiece : player.getInventory().getArmorContents()) {
+      addIfCustomItem(sources, armorPiece);
+    }
+    return sources;
+  }
+
+  private void addIfCustomItem(List<ItemStack> sources, ItemStack stack) {
+    if (stack != null && stack.getType() != Material.AIR && itemService.customItemId(stack).isPresent()) {
+      sources.add(stack);
+    }
+  }
+
+  private record ItemWithAttributes(ItemStack stack, Map<String, String> attributes) {
+  }
+
+  private void mergePotionAttributes(Map<String, String> merged, Map<String, String> candidate) {
+    mergeMaxIntegerAttribute(merged, candidate, "speed_bonus");
+    mergeMaxIntegerAttribute(merged, candidate, "jump_boost");
+    mergeMaxIntegerAttribute(merged, candidate, "haste");
+    mergeMaxIntegerAttribute(merged, candidate, "strength_boost");
+    mergeMaxIntegerAttribute(merged, candidate, "regeneration");
+    mergeMaxDoubleAttribute(merged, candidate, "health_bonus");
+    mergeMaxDoubleAttribute(merged, candidate, "absorption_hearts");
+    mergeBooleanAttribute(merged, candidate, "night_vision");
+    mergeBooleanAttribute(merged, candidate, "water_breathing");
+    mergeBooleanAttribute(merged, candidate, "fire_resistance");
+  }
+
+  private void mergeMaxIntegerAttribute(
+      Map<String, String> merged,
+      Map<String, String> candidate,
+      String key) {
+    itemService.intValue(candidate, key).ifPresent(value -> {
+      int current = itemService.intValue(merged, key).orElse(0);
+      if (value > current) {
+        merged.put(key, String.valueOf(value));
+      }
+    });
+  }
+
+  private void mergeMaxDoubleAttribute(
+      Map<String, String> merged,
+      Map<String, String> candidate,
+      String key) {
+    itemService.doubleValue(candidate, key).ifPresent(value -> {
+      double current = itemService.doubleValue(merged, key).orElse(0.0);
+      if (value > current) {
+        merged.put(key, String.valueOf(value));
+      }
+    });
+  }
+
+  private void mergeBooleanAttribute(
+      Map<String, String> merged,
+      Map<String, String> candidate,
+      String key) {
+    if (itemService.boolValue(candidate, key)) {
+      merged.put(key, "true");
+    }
+  }
+
+  private void removeStaleManagedPotionEffects(Player player, Set<PotionEffectType> desiredEffects) {
+    UUID playerId = player.getUniqueId();
+    Set<PotionEffectType> previousEffects = managedPotionEffects.get(playerId);
+    if (previousEffects != null) {
+      for (PotionEffectType effectType : previousEffects) {
+        if (!desiredEffects.contains(effectType)) {
+          player.removePotionEffect(effectType);
+        }
+      }
+    }
+    if (desiredEffects.isEmpty()) {
+      managedPotionEffects.remove(playerId);
+      return;
+    }
+    managedPotionEffects.put(playerId, new HashSet<>(desiredEffects));
+  }
+
+  private void applyManagedPotionEffect(
+      Player player,
+      PotionEffectType effectType,
+      int amplifier,
+      Set<PotionEffectType> desiredEffects,
+      boolean shouldRefresh) {
+    desiredEffects.add(effectType);
+    PotionEffect active = player.getPotionEffect(effectType);
+    boolean missing = active == null;
+    boolean changedAmplifier = active != null && active.getAmplifier() != amplifier;
+    if (!shouldRefresh && !missing && !changedAmplifier) {
+      return;
+    }
+    player.addPotionEffect(new PotionEffect(effectType, POTION_DURATION_TICKS, amplifier, true, false,
+        false));
   }
 
   private void applyTrailParticles(Player player, Map<String, String> attributes) {
@@ -726,9 +967,10 @@ public final class CustomItemListener implements Listener {
         || player.getGameMode().name().equals("SPECTATOR")) {
       return;
     }
-    if (itemService.boolValue(attributes, "double_jump") && player.isOnGround()) {
+    boolean hasDoubleJump = itemService.intValue(attributes, "double_jump").orElse(0) > 0;
+    if (hasDoubleJump && player.isOnGround()) {
       player.setAllowFlight(true);
-    } else if (!itemService.boolValue(attributes, "double_jump") && player.getAllowFlight()) {
+    } else if (!hasDoubleJump && player.getAllowFlight()) {
       player.setAllowFlight(false);
     }
   }
@@ -1044,6 +1286,14 @@ public final class CustomItemListener implements Listener {
     }
   }
 
+  private void applyDash(Player player, double strength) {
+    Vector dash = player.getLocation().getDirection().normalize().multiply(strength);
+    dash.setY(Math.max(dash.getY(), 0.25));
+    player.setVelocity(dash);
+    player.getWorld().spawnParticle(Particle.CLOUD, player.getLocation().add(0, 0.2, 0), 18, 0.2,
+        0.1, 0.2, 0.01);
+  }
+
   private void applySlowNearby(Player player, int seconds) {
     for (Entity entity : player.getNearbyEntities(6.0, 4.0, 6.0)) {
       if (entity instanceof LivingEntity living && !entity.equals(player)) {
@@ -1185,10 +1435,12 @@ public final class CustomItemListener implements Listener {
       Player player,
       Map<String, String> attributes,
       String attribute,
-      PotionEffectType effectType) {
+      PotionEffectType effectType,
+      Set<PotionEffectType> desiredEffects,
+      boolean shouldRefresh) {
     itemService.intValue(attributes, attribute)
-        .ifPresent(level -> player.addPotionEffect(new PotionEffect(effectType, 60,
-            Math.max(0, level), true, false, false)));
+        .ifPresent(level -> applyManagedPotionEffect(player, effectType, Math.max(0, level - 1),
+            desiredEffects, shouldRefresh));
   }
 
   private void playUseSound(Player player, Map<String, String> attributes) {

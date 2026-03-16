@@ -6,6 +6,7 @@ import com.comphenix.protocol.ProtocolManager;
 import com.comphenix.protocol.events.ListenerPriority;
 import com.comphenix.protocol.events.PacketAdapter;
 import com.comphenix.protocol.events.PacketEvent;
+import com.hudscustomitems.customitems.listener.CustomItemListener;
 import com.hudscustomitems.customitems.service.CustomItemService;
 import java.util.Locale;
 import java.util.Map;
@@ -23,8 +24,10 @@ import org.bukkit.plugin.java.JavaPlugin;
 public final class ProtocolLibBridge {
   private final JavaPlugin plugin;
   private final CustomItemService itemService;
+  private final CustomItemListener customItemListener;
   private ProtocolManager protocolManager;
   private PacketAdapter swingPacketListener;
+  private PacketAdapter emptyHandDashListener;
 
   /**
    * Creates a new bridge instance.
@@ -32,9 +35,13 @@ public final class ProtocolLibBridge {
    * @param plugin owner plugin
    * @param itemService item service
    */
-  public ProtocolLibBridge(JavaPlugin plugin, CustomItemService itemService) {
+  public ProtocolLibBridge(
+      JavaPlugin plugin,
+      CustomItemService itemService,
+      CustomItemListener customItemListener) {
     this.plugin = plugin;
     this.itemService = itemService;
+    this.customItemListener = customItemListener;
   }
 
   /**
@@ -49,6 +56,7 @@ public final class ProtocolLibBridge {
     }
     protocolManager = ProtocolLibrary.getProtocolManager();
     registerSwingPacketParticles();
+    registerEmptyHandDashFallback();
     return true;
   }
 
@@ -59,6 +67,10 @@ public final class ProtocolLibBridge {
     if (protocolManager != null && swingPacketListener != null) {
       protocolManager.removePacketListener(swingPacketListener);
       swingPacketListener = null;
+    }
+    if (protocolManager != null && emptyHandDashListener != null) {
+      protocolManager.removePacketListener(emptyHandDashListener);
+      emptyHandDashListener = null;
     }
   }
 
@@ -96,5 +108,19 @@ public final class ProtocolLibBridge {
       }
     };
     protocolManager.addPacketListener(swingPacketListener);
+  }
+
+  private void registerEmptyHandDashFallback() {
+    emptyHandDashListener = new PacketAdapter(
+        plugin,
+        ListenerPriority.NORMAL,
+        PacketType.Play.Client.USE_ITEM) {
+      @Override
+      public void onPacketReceiving(PacketEvent event) {
+        Player player = event.getPlayer();
+        Bukkit.getScheduler().runTask(plugin, () -> customItemListener.triggerSneakDashFallback(player));
+      }
+    };
+    protocolManager.addPacketListener(emptyHandDashListener);
   }
 }

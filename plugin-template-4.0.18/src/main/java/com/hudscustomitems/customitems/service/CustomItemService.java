@@ -1,6 +1,7 @@
 package com.hudscustomitems.customitems.service;
 
 import com.hudscustomitems.customitems.attribute.AttributeCatalog;
+import com.hudscustomitems.customitems.attribute.AttributeCategory;
 import com.hudscustomitems.customitems.attribute.AttributeDefinition;
 import com.hudscustomitems.customitems.model.CustomItemDefinition;
 import com.hudscustomitems.customitems.storage.ItemStorage;
@@ -981,20 +982,25 @@ public final class CustomItemService {
         lore.add(legacySerializer.deserialize(split));
       }
     }
+    if (!isAttributeDisplayEnabled()) {
+      return;
+    }
     Map<String, String> visible = attributes.entrySet()
         .stream()
         .filter(entry -> !entry.getKey().equals("custom_lore_lines"))
         .filter(entry -> !entry.getKey().equals("animated_lore"))
+        .filter(entry -> isAttributeVisible(entry.getKey()))
         .collect(Collectors.toMap(
             Map.Entry::getKey,
             Map.Entry::getValue,
             (left, right) -> right,
             LinkedHashMap::new));
     if (!visible.isEmpty()) {
-      lore.add(Component.text("Attributes", NamedTextColor.GRAY));
+      if (isAttributeHeaderEnabled()) {
+        lore.add(legacySerializer.deserialize(attributeHeaderLine()));
+      }
       for (Map.Entry<String, String> entry : visible.entrySet()) {
-        lore.add(Component.text("- " + entry.getKey() + ": " + entry.getValue(),
-            NamedTextColor.DARK_GRAY));
+        lore.add(legacySerializer.deserialize(formatAttributeLine(entry.getKey(), entry.getValue())));
       }
     }
   }
@@ -1003,7 +1009,9 @@ public final class CustomItemService {
       Map<String, String> attributes,
       PersistentDataContainer dataContainer,
       List<Component> lore) {
-    lore.add(Component.text("Unmodifiable", NamedTextColor.RED));
+    if (showUnmodifiableTag()) {
+      lore.add(Component.text("Unmodifiable", NamedTextColor.RED));
+    }
     int maxUses = intValue(attributes, "durability")
         .orElse(intValue(attributes, "limited_uses").orElse(0));
     if (maxUses > 0) {
@@ -1021,6 +1029,84 @@ public final class CustomItemService {
     if (owner != null) {
       lore.add(Component.text("Owner: " + owner, NamedTextColor.BLUE));
     }
+  }
+
+  private boolean isAttributeDisplayEnabled() {
+    return plugin.getConfig().getBoolean("attribute-display.enabled", true);
+  }
+
+  private boolean showUnmodifiableTag() {
+    return isAttributeDisplayEnabled()
+        && plugin.getConfig().getBoolean("attribute-display.show-unmodifiable-tag", true);
+  }
+
+  private boolean isAttributeHeaderEnabled() {
+    return plugin.getConfig().getBoolean("attribute-display.header.enabled", true);
+  }
+
+  private String attributeHeaderLine() {
+    return plugin.getConfig().getString("attribute-display.header.line", "&7Attributes");
+  }
+
+  private boolean isAttributeVisible(String attributeId) {
+    String path = "attribute-display.attributes." + attributeId + ".enabled";
+    if (plugin.getConfig().contains(path)) {
+      return plugin.getConfig().getBoolean(path, true);
+    }
+    return !attributeId.equals("custom_name_color")
+        && !attributeId.equals("glow_effect");
+  }
+
+  private String formatAttributeLine(String attributeId, String value) {
+    String basePath = "attribute-display.attributes." + attributeId;
+    boolean showValue = isAttributeValueVisible(attributeId);
+    String defaultFormat = showValue
+        ? "&8- {color}{name}&8: &f{value}"
+        : "&8- {color}{name}";
+    String format = plugin.getConfig().getString(basePath + ".format",
+        plugin.getConfig().getString("attribute-display.line-format", defaultFormat));
+    String name = plugin.getConfig().getString(basePath + ".display-name",
+        AttributeCatalog.byId(attributeId)
+            .map(AttributeDefinition::displayName)
+            .orElse(attributeId));
+    String color = plugin.getConfig().getString(basePath + ".color", defaultAttributeColor(attributeId));
+    String valuePart = showValue ? value : "";
+    return format.replace("{id}", attributeId)
+        .replace("{name}", name)
+        .replace("{color}", color == null ? "" : color)
+        .replace("{value}", valuePart)
+        .replace("{value_part}", showValue ? "&8: &f" + value : "");
+  }
+
+  private boolean isAttributeValueVisible(String attributeId) {
+    String basePath = "attribute-display.attributes." + attributeId + ".show-value";
+    if (plugin.getConfig().contains(basePath)) {
+      return plugin.getConfig().getBoolean(basePath, true);
+    }
+    return plugin.getConfig().getBoolean("attribute-display.show-values-by-default", true);
+  }
+
+  private String defaultAttributeColor(String attributeId) {
+    AttributeCategory category = AttributeCatalog.byId(attributeId)
+        .map(AttributeDefinition::category)
+        .orElse(null);
+    if (category == null) {
+      return "&7";
+    }
+    String configPath = "attribute-display.default-colors." + category.name();
+    if (plugin.getConfig().contains(configPath)) {
+      return plugin.getConfig().getString(configPath, "&7");
+    }
+    return switch (category) {
+      case TOOL_BLOCK -> "&e";
+      case COMBAT -> "&c";
+      case PLAYER_BUFF -> "&a";
+      case UTILITY -> "&b";
+      case DURABILITY -> "&6";
+      case VISUAL -> "&d";
+      case SPECIAL -> "&5";
+      case RESTRICTION -> "&7";
+    };
   }
 
   private Component buildDisplayName(

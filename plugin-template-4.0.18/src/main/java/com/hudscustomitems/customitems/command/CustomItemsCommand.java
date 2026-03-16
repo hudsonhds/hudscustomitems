@@ -1,10 +1,12 @@
 package com.hudscustomitems.customitems.command;
 
+import com.hudscustomitems.customitems.CustomItemsPlugin;
 import com.hudscustomitems.customitems.attribute.AttributeCatalog;
 import com.hudscustomitems.customitems.attribute.AttributeCategory;
 import com.hudscustomitems.customitems.attribute.AttributeDefinition;
 import com.hudscustomitems.customitems.attribute.AttributeValueType;
 import com.hudscustomitems.customitems.model.CustomItemDefinition;
+import com.hudscustomitems.customitems.service.ConfigUpdater;
 import com.hudscustomitems.customitems.service.CustomItemService;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -338,9 +340,23 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
   }
 
   private void handleReload(CommandSender sender) {
-    plugin.reloadConfig();
+    ConfigUpdater.UpdateSummary summary;
+    if (plugin instanceof CustomItemsPlugin customItemsPlugin) {
+      summary = customItemsPlugin.reloadConfigWithUpdate();
+    } else {
+      plugin.reloadConfig();
+      summary = new ConfigUpdater.UpdateSummary(false, 0, false, false, null);
+    }
     itemService.reloadDefinitions();
-    sender.sendMessage(color("&aReloaded config.yml and items.yml"));
+    if (!summary.changed()) {
+      sender.sendMessage(color("&aReloaded config.yml and items.yml (no config changes)."));
+      return;
+    }
+    String backupPart = summary.backupPath() == null
+        ? ""
+        : " &7(backup: &f" + summary.backupPath() + "&7)";
+    sender.sendMessage(color("&aReloaded config.yml and items.yml. Added &f"
+        + summary.addedKeys() + "&a missing config key(s)." + backupPart));
   }
 
   private void handleList(CommandSender sender) {
