@@ -16,7 +16,7 @@ static def getTime() {
     return sdf.format(new Date()).toString()
 }
 
-String defaultVersionLabel = "1.0.1"
+String defaultVersionLabel = "1.0.2"
 if (hasProperty('ver') && ver != null && ver.toString().trim() != "") {
     version = ver.toString().trim()
 } else {

@@ -833,8 +833,7 @@ public final class CustomItemService {
       String actionKey,
       Map<String, String> attributes,
       boolean notify) {
-    long cooldownMs = intValue(attributes, "cooldown_time")
-        .orElse(plugin.getConfig().getInt("default-cooldown-ms", 1250));
+    long cooldownMs = intValue(attributes, "cooldown_time").orElse(0);
     if (cooldownMs <= 0) {
       return true;
     }
@@ -1053,23 +1052,42 @@ public final class CustomItemService {
     if (plugin.getConfig().contains(path)) {
       return plugin.getConfig().getBoolean(path, true);
     }
+    if (attributeId.equals("enchantments")
+        ) {
+      return false;
+    }
+    if (AttributeCatalog.byId(attributeId)
+        .map(AttributeDefinition::category)
+        .orElse(null) == AttributeCategory.RESTRICTION) {
+      return false;
+    }
     return !attributeId.equals("custom_name_color")
         && !attributeId.equals("glow_effect");
   }
 
   private String formatAttributeLine(String attributeId, String value) {
+    if (attributeId.equals("block_whitelist")) {
+      return "&8- &eCan be used on&8: &f" + formatMaterialListDisplay(value);
+    }
+    if (attributeId.equals("block_blacklist")) {
+      return "&8- &eCan't be used on&8: &f" + formatMaterialListDisplay(value);
+    }
     String basePath = "attribute-display.attributes." + attributeId;
     boolean showValue = isAttributeValueVisible(attributeId);
-    String defaultFormat = showValue
-        ? "&8- {color}{name}&8: &f{value}"
-        : "&8- {color}{name}";
-    String format = plugin.getConfig().getString(basePath + ".format",
-        plugin.getConfig().getString("attribute-display.line-format", defaultFormat));
     String name = plugin.getConfig().getString(basePath + ".display-name",
         AttributeCatalog.byId(attributeId)
             .map(AttributeDefinition::displayName)
             .orElse(attributeId));
     String color = plugin.getConfig().getString(basePath + ".color", defaultAttributeColor(attributeId));
+    if (showValue && shouldUseValueFirstFormat(attributeId) && !plugin.getConfig().contains(basePath
+        + ".format")) {
+      return "&8- &f" + value + " " + (color == null ? "" : color) + name;
+    }
+    String defaultFormat = showValue
+        ? "&8- {color}{name}&8: &f{value}"
+        : "&8- {color}{name}";
+    String format = plugin.getConfig().getString(basePath + ".format",
+        plugin.getConfig().getString("attribute-display.line-format", defaultFormat));
     String valuePart = showValue ? value : "";
     return format.replace("{id}", attributeId)
         .replace("{name}", name)
@@ -1078,12 +1096,48 @@ public final class CustomItemService {
         .replace("{value_part}", showValue ? "&8: &f" + value : "");
   }
 
+  private String formatMaterialListDisplay(String raw) {
+    if (raw == null || raw.isBlank()) {
+      return "";
+    }
+    return java.util.Arrays.stream(raw.split(","))
+        .map(String::trim)
+        .filter(split -> !split.isBlank())
+        .map(this::formatMaterialName)
+        .collect(Collectors.joining(", "));
+  }
+
+  private String formatMaterialName(String name) {
+    String[] words = name.toLowerCase(Locale.ROOT).split("_");
+    List<String> converted = new ArrayList<>();
+    for (String word : words) {
+      if (word.isBlank()) {
+        continue;
+      }
+      converted.add(word.substring(0, 1).toUpperCase(Locale.ROOT) + word.substring(1));
+    }
+    return String.join(" ", converted);
+  }
+
   private boolean isAttributeValueVisible(String attributeId) {
     String basePath = "attribute-display.attributes." + attributeId + ".show-value";
     if (plugin.getConfig().contains(basePath)) {
       return plugin.getConfig().getBoolean(basePath, true);
     }
+    if (isCombatAttribute(attributeId)) {
+      return true;
+    }
     return plugin.getConfig().getBoolean("attribute-display.show-values-by-default", true);
+  }
+
+  private boolean shouldUseValueFirstFormat(String attributeId) {
+    return isCombatAttribute(attributeId);
+  }
+
+  private boolean isCombatAttribute(String attributeId) {
+    return AttributeCatalog.byId(attributeId)
+        .map(AttributeDefinition::category)
+        .orElse(null) == AttributeCategory.COMBAT;
   }
 
   private String defaultAttributeColor(String attributeId) {

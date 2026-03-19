@@ -60,6 +60,9 @@ public final class AttributeCatalog {
     register("sell_container", "Sell Container", AttributeCategory.TOOL_BLOCK,
         AttributeValueType.BOOLEAN,
         "Right click a container to sell its contents with hooked shop prices.");
+    register("sell_container_on_click", "Sell Container on Click", AttributeCategory.TOOL_BLOCK,
+        AttributeValueType.BOOLEAN,
+        "Right click a container to sell its contents without breaking it.");
 
     register("attack_damage", "Attack Damage", AttributeCategory.COMBAT, AttributeValueType.DECIMAL,
         "Extra base damage dealt.");
@@ -231,6 +234,12 @@ public final class AttributeCatalog {
         AttributeValueType.BOOLEAN, "Only original owner can use.");
     register("soulbound", "Soulbound", AttributeCategory.RESTRICTION,
         AttributeValueType.BOOLEAN, "Cannot be dropped or traded.");
+    register("prevent_placement", "Prevent Placement", AttributeCategory.RESTRICTION,
+        AttributeValueType.BOOLEAN, "Prevents this custom item from being placed as a block.");
+    register("prevent_eating", "Prevent Eating", AttributeCategory.RESTRICTION,
+        AttributeValueType.BOOLEAN, "Prevents this custom item from being eaten.");
+    register("prevent_feeding", "Prevent Feeding", AttributeCategory.RESTRICTION,
+        AttributeValueType.BOOLEAN, "Prevents this custom item from being fed to animals.");
     register("upgradeable", "Upgradeable", AttributeCategory.RESTRICTION,
         AttributeValueType.BOOLEAN, "Can gain new levels and stats.");
   }

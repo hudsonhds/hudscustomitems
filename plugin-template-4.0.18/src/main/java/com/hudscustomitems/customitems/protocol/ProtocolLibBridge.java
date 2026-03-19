@@ -12,6 +12,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import org.bukkit.Bukkit;
+import org.bukkit.Material;
 import org.bukkit.Particle;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
@@ -92,19 +93,33 @@ public final class ProtocolLibBridge {
         if (particleName == null || particleName.isBlank()) {
           return;
         }
-        try {
-          Particle particle = Particle.valueOf(particleName.toUpperCase(Locale.ROOT));
-          Bukkit.getScheduler().runTask(plugin, () -> player.getWorld().spawnParticle(
-              particle,
+        Optional<ConfiguredParticle> configured = parseConfiguredParticle(particleName);
+        if (configured.isEmpty()) {
+          return;
+        }
+        ConfiguredParticle particle = configured.get();
+        Bukkit.getScheduler().runTask(plugin, () -> {
+          if (particle.data() == null) {
+            player.getWorld().spawnParticle(
+                particle.particle(),
+                player.getEyeLocation().add(player.getLocation().getDirection().multiply(1.1)),
+                10,
+                0.18,
+                0.18,
+                0.18,
+                0.03);
+            return;
+          }
+          player.getWorld().spawnParticle(
+              particle.particle(),
               player.getEyeLocation().add(player.getLocation().getDirection().multiply(1.1)),
               10,
               0.18,
               0.18,
               0.18,
-              0.03));
-        } catch (IllegalArgumentException ex) {
-          // Invalid particle id set by configuration.
-        }
+              0.03,
+              particle.data());
+        });
       }
     };
     protocolManager.addPacketListener(swingPacketListener);
@@ -122,5 +137,37 @@ public final class ProtocolLibBridge {
       }
     };
     protocolManager.addPacketListener(emptyHandDashListener);
+  }
+
+  private Optional<ConfiguredParticle> parseConfiguredParticle(String value) {
+    if (value == null || value.isBlank()) {
+      return Optional.empty();
+    }
+    String normalized = value.trim().toUpperCase(Locale.ROOT);
+    try {
+      return Optional.of(new ConfiguredParticle(Particle.valueOf(normalized), null));
+    } catch (IllegalArgumentException ex) {
+      String materialName = normalized.startsWith("BLOCK:")
+          ? normalized.substring("BLOCK:".length())
+          : normalized;
+      Material material = safeMaterial(materialName);
+      if (material != null && material.isBlock()) {
+        return Optional.of(new ConfiguredParticle(Particle.BLOCK, material.createBlockData()));
+      }
+      return Optional.empty();
+    }
+  }
+
+  private Material safeMaterial(String value) {
+    try {
+      return Material.valueOf(value.trim().toUpperCase(Locale.ROOT));
+    } catch (IllegalArgumentException ex) {
+      return null;
+    }
+  }
+
+  private record ConfiguredParticle(
+      Particle particle,
+      Object data) {
   }
 }

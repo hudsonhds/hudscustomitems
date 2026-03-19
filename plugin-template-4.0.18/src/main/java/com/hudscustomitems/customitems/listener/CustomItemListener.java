@@ -23,6 +23,7 @@ import org.bukkit.Particle;
 import org.bukkit.Sound;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
+import org.bukkit.block.Container;
 import org.bukkit.block.data.Ageable;
 import org.bukkit.entity.AbstractArrow;
 import org.bukkit.entity.Entity;
@@ -32,12 +33,15 @@ import org.bukkit.entity.Item;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Projectile;
+import org.bukkit.entity.Animals;
+import org.bukkit.entity.AbstractHorse;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockDropItemEvent;
+import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.enchantment.EnchantItemEvent;
 import org.bukkit.event.enchantment.PrepareItemEnchantEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
@@ -48,7 +52,9 @@ import org.bukkit.event.inventory.PrepareAnvilEvent;
 import org.bukkit.event.inventory.PrepareGrindstoneEvent;
 import org.bukkit.event.inventory.PrepareSmithingEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
+import org.bukkit.event.player.PlayerItemConsumeEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
@@ -57,6 +63,7 @@ import org.bukkit.event.player.PlayerToggleSneakEvent;
 import org.bukkit.inventory.CookingRecipe;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.Recipe;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -160,6 +167,9 @@ public final class CustomItemListener implements Listener {
       if (outcome.handled()) {
         if (outcome.success()) {
           player.sendMessage(color("&a" + outcome.message()));
+          clearContainerContents(event.getBlock());
+          dropUnsoldStacks(event.getBlock(), outcome.unsoldDrops());
+          event.setDropItems(false);
         } else if (!outcome.message().isBlank()) {
           player.sendMessage(color("&e" + outcome.message()));
         }
@@ -175,9 +185,15 @@ public final class CustomItemListener implements Listener {
     if (itemService.boolValue(attributes, "no_block_drops")) {
       event.setDropItems(false);
     }
-    optionalParticle(attributes.get("mining_particles")).ifPresent(particle -> player.getWorld()
-        .spawnParticle(particle, event.getBlock().getLocation().add(0.5, 0.6, 0.5), 18, 0.35, 0.35,
-            0.35, 0.02));
+    spawnConfiguredParticle(
+        player,
+        attributes.get("mining_particles"),
+        event.getBlock().getLocation().add(0.5, 0.6, 0.5),
+        18,
+        0.35,
+        0.35,
+        0.35,
+        0.02);
     Set<Block> extra = collectExtraBlocks(event.getBlock(), player, attributes);
     if (!extra.isEmpty()) {
       for (Block block : extra) {
@@ -301,6 +317,20 @@ public final class CustomItemListener implements Listener {
       return;
     }
     if (event.getClickedBlock() != null) {
+      if (itemService.boolValue(attributes, "sell_container_on_click")) {
+        SellOutcome outcome = sellContainerService.sellContainer(player, event.getClickedBlock());
+        if (outcome.handled()) {
+          if (outcome.success()) {
+            player.sendMessage(color("&a" + outcome.message()));
+            replaceContainerWithUnsold(event.getClickedBlock(), outcome.unsoldDrops());
+            itemService.consumeUse(player, held);
+          } else if (!outcome.message().isBlank()) {
+            player.sendMessage(color("&e" + outcome.message()));
+          }
+          event.setCancelled(true);
+          return;
+        }
+      }
       applyTillRadius(player, event.getClickedBlock(), attributes);
       applyPlacementRadius(player, event.getClickedBlock(), event.getBlockFace(), held, attributes);
       applyBlockReplace(player, event.getClickedBlock(), attributes);
@@ -377,6 +407,7 @@ public final class CustomItemListener implements Listener {
     }
     Map<String, String> attributes = itemService.resolveAttributes(held);
     applyCombatAttributes(attacker, event, attributes);
+    playSwingParticles(attacker, attributes);
     playHitSound(attacker, attributes);
     itemService.consumeUse(attacker, held);
   }
@@ -438,6 +469,51 @@ public final class CustomItemListener implements Listener {
       event.setCancelled(true);
       event.getPlayer().sendMessage(color("&cSoulbound items cannot be dropped."));
     }
+  }
+
+  @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+  public void onItemConsume(PlayerItemConsumeEvent event) {
+    ItemStack consumed = event.getItem();
+    if (itemService.customItemId(consumed).isEmpty()) {
+      return;
+    }
+    Map<String, String> attributes = itemService.resolveAttributes(consumed);
+    if (!isPreventedByDefault(attributes, "prevent_eating")) {
+      return;
+    }
+    event.setCancelled(true);
+    event.getPlayer().sendMessage(color("&cThis custom item cannot be eaten."));
+  }
+
+  @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+  public void onEntityFeed(PlayerInteractEntityEvent event) {
+    ItemStack used = event.getPlayer().getInventory().getItem(event.getHand());
+    if (itemService.customItemId(used).isEmpty()) {
+      return;
+    }
+    if (!(event.getRightClicked() instanceof Animals)
+        && !(event.getRightClicked() instanceof AbstractHorse)) {
+      return;
+    }
+    Map<String, String> attributes = itemService.resolveAttributes(used);
+    if (!isPreventedByDefault(attributes, "prevent_feeding")) {
+      return;
+    }
+    event.setCancelled(true);
+    event.getPlayer().sendMessage(color("&cThis custom item cannot be fed to animals."));
+  }
+
+  @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
+  public void onBlockPlace(BlockPlaceEvent event) {
+    ItemStack placed = event.getItemInHand();
+    if (itemService.customItemId(placed).isEmpty()) {
+      return;
+    }
+    Map<String, String> attributes = itemService.resolveAttributes(placed);
+    if (!isPreventedByDefault(attributes, "prevent_placement")) {
+      return;
+    }
+    event.setCancelled(true);
   }
 
   @EventHandler(priority = EventPriority.HIGHEST)
@@ -878,8 +954,8 @@ public final class CustomItemListener implements Listener {
     if (particleName == null || particleName.isBlank()) {
       return;
     }
-    optionalParticle(particleName).ifPresent(particle -> player.getWorld().spawnParticle(particle,
-        player.getLocation().add(0, 0.15, 0), 10, 0.25, 0.1, 0.25, 0.01));
+    spawnConfiguredParticle(player, particleName, player.getLocation().add(0, 0.15, 0), 10, 0.25,
+        0.1, 0.25, 0.01);
   }
 
   private void applyBlockHighlighting(Player player, Map<String, String> attributes) {
@@ -1461,6 +1537,58 @@ public final class CustomItemListener implements Listener {
         sound, 1.0f, 1.0f));
   }
 
+  private void playSwingParticles(Player player, Map<String, String> attributes) {
+    String particleName = attributes.get("swing_particles");
+    if (particleName == null || particleName.isBlank()) {
+      return;
+    }
+    spawnConfiguredParticle(
+        player,
+        particleName,
+        player.getEyeLocation().add(player.getLocation().getDirection().multiply(1.1)),
+        10,
+        0.18,
+        0.18,
+        0.18,
+        0.03);
+  }
+
+  private void spawnConfiguredParticle(
+      Player player,
+      String configuredValue,
+      Location location,
+      int count,
+      double offsetX,
+      double offsetY,
+      double offsetZ,
+      double extra) {
+    Optional<ConfiguredParticle> configured = parseConfiguredParticle(configuredValue);
+    if (configured.isEmpty()) {
+      return;
+    }
+    ConfiguredParticle particle = configured.get();
+    if (particle.data() == null) {
+      player.getWorld().spawnParticle(
+          particle.particle(),
+          location,
+          count,
+          offsetX,
+          offsetY,
+          offsetZ,
+          extra);
+      return;
+    }
+    player.getWorld().spawnParticle(
+        particle.particle(),
+        location,
+        count,
+        offsetX,
+        offsetY,
+        offsetZ,
+        extra,
+        particle.data());
+  }
+
   private void animateLoreIfNeeded(ItemStack held, Map<String, String> attributes) {
     String animation = attributes.get("animated_lore");
     if (animation == null || animation.isBlank()) {
@@ -1542,6 +1670,57 @@ public final class CustomItemListener implements Listener {
     };
   }
 
+  private void dropUnsoldStacks(Block block, List<ItemStack> unsoldDrops) {
+    if (unsoldDrops.isEmpty()) {
+      return;
+    }
+    Location dropLocation = block.getLocation().add(0.5, 0.5, 0.5);
+    for (ItemStack stack : unsoldDrops) {
+      if (stack == null || stack.getType() == Material.AIR || stack.getAmount() <= 0) {
+        continue;
+      }
+      block.getWorld().dropItemNaturally(dropLocation, stack.clone());
+    }
+  }
+
+  private void replaceContainerWithUnsold(Block block, List<ItemStack> unsoldDrops) {
+    if (!(block.getState() instanceof InventoryHolder holder)) {
+      return;
+    }
+    Inventory inventory = holder.getInventory();
+    if (inventory == null) {
+      return;
+    }
+    inventory.clear();
+    Location dropLocation = block.getLocation().add(0.5, 0.5, 0.5);
+    for (ItemStack stack : unsoldDrops) {
+      if (stack == null || stack.getType() == Material.AIR || stack.getAmount() <= 0) {
+        continue;
+      }
+      HashMap<Integer, ItemStack> overflow = inventory.addItem(stack.clone());
+      for (ItemStack overflowStack : overflow.values()) {
+        block.getWorld().dropItemNaturally(dropLocation, overflowStack);
+      }
+    }
+    if (block.getState() instanceof Container container) {
+      container.update(true, false);
+    }
+  }
+
+  private void clearContainerContents(Block block) {
+    if (!(block.getState() instanceof InventoryHolder holder)) {
+      return;
+    }
+    Inventory inventory = holder.getInventory();
+    if (inventory == null) {
+      return;
+    }
+    inventory.clear();
+    if (block.getState() instanceof Container container) {
+      container.update(true, false);
+    }
+  }
+
   private Set<Material> parseMaterialList(String value) {
     Set<Material> materials = new HashSet<>();
     for (String split : value.split(",")) {
@@ -1613,13 +1792,21 @@ public final class CustomItemListener implements Listener {
         || material == Material.SPAWNER;
   }
 
-  private Optional<Particle> optionalParticle(String value) {
+  private Optional<ConfiguredParticle> parseConfiguredParticle(String value) {
     if (value == null || value.isBlank()) {
       return Optional.empty();
     }
+    String normalized = value.trim().toUpperCase(Locale.ROOT);
     try {
-      return Optional.of(Particle.valueOf(value.toUpperCase(Locale.ROOT)));
+      return Optional.of(new ConfiguredParticle(Particle.valueOf(normalized), null));
     } catch (IllegalArgumentException ex) {
+      String materialName = normalized.startsWith("BLOCK:")
+          ? normalized.substring("BLOCK:".length())
+          : normalized;
+      Material material = safeMaterial(materialName);
+      if (material != null && material.isBlock()) {
+        return Optional.of(new ConfiguredParticle(Particle.BLOCK, material.createBlockData()));
+      }
       return Optional.empty();
     }
   }
@@ -1676,5 +1863,17 @@ public final class CustomItemListener implements Listener {
 
   private String color(String message) {
     return ChatColor.translateAlternateColorCodes('&', message);
+  }
+
+  private boolean isPreventedByDefault(Map<String, String> attributes, String key) {
+    if (!attributes.containsKey(key)) {
+      return true;
+    }
+    return itemService.boolValue(attributes, key);
+  }
+
+  private record ConfiguredParticle(
+      Particle particle,
+      Object data) {
   }
 }

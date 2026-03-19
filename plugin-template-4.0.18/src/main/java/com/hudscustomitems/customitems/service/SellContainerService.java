@@ -6,12 +6,15 @@ import java.lang.reflect.Method;
 import java.text.DecimalFormat;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalDouble;
+import java.util.Set;
+import java.util.stream.Collectors;
 import org.bukkit.Bukkit;
 import org.bukkit.Material;
 import org.bukkit.OfflinePlayer;
@@ -36,6 +39,7 @@ public final class SellContainerService {
   private final VaultEconomyBridge vaultEconomyBridge;
   private final DecimalFormat moneyFormat;
   private final List<SellPriceProvider> priceProviders;
+  private final Set<String> loggedWarnings;
 
   /**
    * Creates a new sell container service.
@@ -47,6 +51,7 @@ public final class SellContainerService {
     this.vaultEconomyBridge = new VaultEconomyBridge(plugin);
     this.moneyFormat = new DecimalFormat("#,##0.00");
     this.priceProviders = createProviderChain();
+    this.loggedWarnings = new HashSet<>();
   }
 
   /**
@@ -70,6 +75,7 @@ public final class SellContainerService {
     }
 
     List<SoldStack> sold = new ArrayList<>();
+    List<ItemStack> unsoldDrops = new ArrayList<>();
     int totalSoldItems = 0;
     double totalEarnings = 0.0;
     for (int slot = 0; slot < inventory.getSize(); slot++) {
@@ -79,10 +85,12 @@ public final class SellContainerService {
       }
       Optional<PriceQuote> quote = quoteSellValue(player, stack);
       if (quote.isEmpty()) {
+        unsoldDrops.add(stack.clone());
         continue;
       }
       double unitPrice = quote.get().unitPrice();
       if (unitPrice <= 0.0) {
+        unsoldDrops.add(stack.clone());
         continue;
       }
       int amount = stack.getAmount();
@@ -125,18 +133,37 @@ public final class SellContainerService {
       summary.append(String.join(", ", parts));
     }
     return SellOutcome.handledSuccess(totalSoldItems, totalEarnings, providerBreakdown,
-        summary.toString());
+        unsoldDrops, summary.toString());
   }
 
   private Optional<PriceQuote> quoteSellValue(Player player, ItemStack stack) {
-    for (SellPriceProvider provider : configuredPriceProviders()) {
+    ItemStack pricedStack = stack.clone();
+    pricedStack.setAmount(1);
+    List<SellPriceProvider> providers = configuredPriceProviders();
+    if (providers.isEmpty()) {
+      return Optional.empty();
+    }
+    boolean forcedMode = isForcedProviderMode();
+    for (SellPriceProvider provider : providers) {
       if (!provider.available()) {
+        if (forcedMode) {
+          warnOnce("sell-provider-unavailable:" + provider.name(),
+              "Forced sell provider '" + provider.name()
+                  + "' is not available (plugin/API not detected).");
+        }
         continue;
       }
-      OptionalDouble price = provider.sellPrice(player, stack);
+      OptionalDouble price = provider.sellPrice(player, pricedStack);
       if (price.isPresent() && price.getAsDouble() > 0.0) {
         return Optional.of(new PriceQuote(provider.name(), price.getAsDouble()));
       }
+    }
+    if (forcedMode) {
+      SellPriceProvider provider = providers.get(0);
+      String diagnostics = providerDiagnostics(provider);
+      warnOnce("sell-provider-no-prices:" + provider.name(),
+          "Forced sell provider '" + provider.name()
+              + "' returned no sell prices. " + diagnostics);
     }
     return Optional.empty();
   }
@@ -146,9 +173,15 @@ public final class SellContainerService {
     chain.add(new ReflectionProvider(
         plugin,
         "EconomyShopGUI",
-        List.of("EconomyShopGUI"),
-        List.of("me.gypopo.economyshopgui.api.EconomyShopGUIHook"),
-        List.of("getSellPrice", "getItemStackSellPrice", "getPrice")));
+        List.of(
+            "EconomyShopGUI",
+            "EconomyShopGUI Premium",
+            "EconomyShopGUI-Premium",
+            "EconomyShopGUIPremium"),
+        List.of(
+            "me.gypopo.economyshopgui.api.EconomyShopGUIHook",
+            "me.gypopo.economyshopgui.api.EconomyShopGUIAPI"),
+        List.of("getItemSellPrice", "getSellPrice", "getItemStackSellPrice")));
     chain.add(new ReflectionProvider(
         plugin,
         "ShopGUIPlus",
@@ -203,17 +236,20 @@ public final class SellContainerService {
   }
 
   private List<SellPriceProvider> configuredPriceProviders() {
-    String forcedProvider = plugin.getConfig().getString("sell-container.provider", "auto");
+    String forcedProvider = forcedProviderName();
     if (forcedProvider != null
         && !forcedProvider.isBlank()
         && !forcedProvider.equalsIgnoreCase("auto")) {
       List<SellPriceProvider> single = new ArrayList<>();
       for (SellPriceProvider provider : priceProviders) {
-        if (provider.name().equalsIgnoreCase(forcedProvider.trim())) {
+        if (matchesProviderName(provider.name(), forcedProvider.trim())) {
           single.add(provider);
           return single;
         }
       }
+      warnOnce("sell-provider-unknown:" + forcedProvider.toLowerCase(Locale.ROOT),
+          "Configured sell provider '" + forcedProvider + "' was not found. "
+              + "Valid providers: " + availableProviderNames());
       return List.of();
     }
     List<String> configuredOrder = plugin.getConfig().getStringList("sell-container.provider-order");
@@ -235,6 +271,48 @@ public final class SellContainerService {
     return ordered;
   }
 
+  private String forcedProviderName() {
+    return plugin.getConfig().getString("sell-container.provider", "auto");
+  }
+
+  private boolean isForcedProviderMode() {
+    String forcedProvider = forcedProviderName();
+    return forcedProvider != null
+        && !forcedProvider.isBlank()
+        && !forcedProvider.equalsIgnoreCase("auto");
+  }
+
+  private boolean matchesProviderName(String providerName, String configuredName) {
+    String left = normalizeToken(providerName);
+    String right = normalizeToken(configuredName);
+    return left.equals(right);
+  }
+
+  private String normalizeToken(String value) {
+    return value.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
+  }
+
+  private String availableProviderNames() {
+    List<String> names = new ArrayList<>();
+    for (SellPriceProvider provider : priceProviders) {
+      names.add(provider.name());
+    }
+    return String.join(", ", names);
+  }
+
+  private void warnOnce(String key, String message) {
+    if (loggedWarnings.add(key)) {
+      plugin.getLogger().warning("[SellContainer] " + message);
+    }
+  }
+
+  private String providerDiagnostics(SellPriceProvider provider) {
+    if (provider instanceof ReflectionProvider reflectionProvider) {
+      return reflectionProvider.diagnostics();
+    }
+    return "Check provider configuration and API availability.";
+  }
+
   private record SoldStack(int slot, int amount, double stackValue, String providerName) {
   }
 
@@ -249,6 +327,7 @@ public final class SellContainerService {
    * @param soldItems item amount sold
    * @param totalValue total money value
    * @param providerBreakdown totals by provider
+   * @param unsoldDrops unsold item stacks that should be dropped
    * @param message player-facing summary
    */
   public record SellOutcome(
@@ -257,22 +336,27 @@ public final class SellContainerService {
       int soldItems,
       double totalValue,
       Map<String, Double> providerBreakdown,
+      List<ItemStack> unsoldDrops,
       String message) {
     static SellOutcome notHandled() {
-      return new SellOutcome(false, false, 0, 0.0, Map.of(), "");
+      return new SellOutcome(false, false, 0, 0.0, Map.of(), List.of(), "");
     }
 
     static SellOutcome handledFailure(String message) {
-      return new SellOutcome(true, false, 0, 0.0, Map.of(), message);
+      return new SellOutcome(true, false, 0, 0.0, Map.of(), List.of(), message);
     }
 
     static SellOutcome handledSuccess(
         int soldItems,
         double totalValue,
         Map<String, Double> providerBreakdown,
+        List<ItemStack> unsoldDrops,
         String message) {
+      List<ItemStack> immutableDrops = unsoldDrops.stream()
+          .map(ItemStack::clone)
+          .collect(Collectors.toList());
       return new SellOutcome(true, true, soldItems, totalValue, Map.copyOf(providerBreakdown),
-          message);
+          List.copyOf(immutableDrops), message);
     }
   }
 
@@ -306,7 +390,15 @@ public final class SellContainerService {
 
     @Override
     public boolean available() {
-      return findPlugin().isPresent();
+      if (findPlugin().isPresent()) {
+        return true;
+      }
+      for (String className : classCandidates) {
+        if (classForName(className).isPresent()) {
+          return true;
+        }
+      }
+      return false;
     }
 
     @Override
@@ -317,9 +409,6 @@ public final class SellContainerService {
     @Override
     public OptionalDouble sellPrice(Player player, ItemStack stack) {
       Optional<Plugin> pluginInstance = findPlugin();
-      if (pluginInstance.isEmpty()) {
-        return OptionalDouble.empty();
-      }
       for (String className : classCandidates) {
         Optional<Class<?>> found = classForName(className);
         if (found.isEmpty()) {
@@ -329,6 +418,9 @@ public final class SellContainerService {
         if (staticResult.isPresent()) {
           return staticResult;
         }
+      }
+      if (pluginInstance.isEmpty()) {
+        return OptionalDouble.empty();
       }
       OptionalDouble pluginResult = invokePriceMethod(
           pluginInstance.get().getClass(),
@@ -348,11 +440,17 @@ public final class SellContainerService {
         boolean candidateName = methodCandidates
             .stream()
             .map(name -> name.toLowerCase(Locale.ROOT))
-            .anyMatch(methodName::contains);
+            .anyMatch(methodName::equals);
+        if (!candidateName) {
+          candidateName = methodName.contains("sell")
+              && (methodName.endsWith("price")
+                  || methodName.endsWith("value")
+                  || methodName.endsWith("worth"));
+        }
         if (!candidateName) {
           continue;
         }
-        Optional<Object> result = invokeIfSupported(method, target, player, stack);
+        Optional<Object> result = invokeWithSupportedArguments(method, target, player, stack);
         if (result.isEmpty()) {
           continue;
         }
@@ -364,38 +462,119 @@ public final class SellContainerService {
       return OptionalDouble.empty();
     }
 
-    private Optional<Object> invokeIfSupported(
+    private Optional<Object> invokeWithSupportedArguments(
         Method method,
         Object target,
         Player player,
         ItemStack stack) {
-      Class<?>[] parameters = method.getParameterTypes();
+      List<Object[]> options = buildArgumentOptions(method.getParameterTypes(), player, stack);
+      if (options.isEmpty()) {
+        return Optional.empty();
+      }
       try {
-        if (parameters.length == 2
-            && Player.class.isAssignableFrom(parameters[0])
-            && ItemStack.class.isAssignableFrom(parameters[1])) {
-          return Optional.ofNullable(method.invoke(target, player, stack));
+        for (Object[] arguments : options) {
+          try {
+            Object result = method.invoke(target, arguments);
+            if (result != null) {
+              return Optional.of(result);
+            }
+          } catch (ReflectiveOperationException | IllegalArgumentException ignored) {
+            // Try next candidate argument combination.
+          }
         }
-        if (parameters.length == 2
-            && ItemStack.class.isAssignableFrom(parameters[0])
-            && Player.class.isAssignableFrom(parameters[1])) {
-          return Optional.ofNullable(method.invoke(target, stack, player));
-        }
-        if (parameters.length == 1 && ItemStack.class.isAssignableFrom(parameters[0])) {
-          return Optional.ofNullable(method.invoke(target, stack));
-        }
-        if (parameters.length == 2
-            && Material.class.isAssignableFrom(parameters[0])
-            && parameters[1] == int.class) {
-          return Optional.ofNullable(method.invoke(target, stack.getType(), stack.getAmount()));
-        }
-        if (parameters.length == 1 && Material.class.isAssignableFrom(parameters[0])) {
-          return Optional.ofNullable(method.invoke(target, stack.getType()));
-        }
-      } catch (ReflectiveOperationException ex) {
+      } catch (SecurityException ignored) {
         return Optional.empty();
       }
       return Optional.empty();
+    }
+
+    private List<Object[]> buildArgumentOptions(
+        Class<?>[] parameterTypes,
+        Player player,
+        ItemStack stack) {
+      List<List<Object>> optionsPerParameter = new ArrayList<>();
+      for (Class<?> parameter : parameterTypes) {
+        List<Object> options = argumentOptions(parameter, player, stack);
+        if (options.isEmpty()) {
+          return List.of();
+        }
+        optionsPerParameter.add(options);
+      }
+      List<Object[]> combinations = new ArrayList<>();
+      buildArgumentCombinations(optionsPerParameter, 0, new Object[parameterTypes.length],
+          combinations);
+      return combinations;
+    }
+
+    private void buildArgumentCombinations(
+        List<List<Object>> optionsPerParameter,
+        int index,
+        Object[] current,
+        List<Object[]> output) {
+      if (index >= optionsPerParameter.size()) {
+        output.add(current.clone());
+        return;
+      }
+      for (Object option : optionsPerParameter.get(index)) {
+        current[index] = option;
+        buildArgumentCombinations(optionsPerParameter, index + 1, current, output);
+      }
+    }
+
+    private List<Object> argumentOptions(Class<?> parameter, Player player, ItemStack stack) {
+      if (parameter.isAssignableFrom(player.getClass())
+          || OfflinePlayer.class.isAssignableFrom(parameter)) {
+        return List.of(player);
+      }
+      if (parameter.isAssignableFrom(stack.getClass())) {
+        return List.of(stack);
+      }
+      if (Material.class.isAssignableFrom(parameter)) {
+        return List.of(stack.getType());
+      }
+      if (parameter == int.class || parameter == Integer.class) {
+        return List.of(stack.getAmount(), 1);
+      }
+      if (parameter == double.class || parameter == Double.class) {
+        return List.of((double) stack.getAmount(), 1.0d);
+      }
+      if (parameter == float.class || parameter == Float.class) {
+        return List.of((float) stack.getAmount(), 1.0f);
+      }
+      if (parameter == long.class || parameter == Long.class) {
+        return List.of((long) stack.getAmount(), 1L);
+      }
+      if (parameter == boolean.class || parameter == Boolean.class) {
+        return List.of(Boolean.TRUE, Boolean.FALSE);
+      }
+      if (parameter.isEnum()) {
+        List<Object> enumOptions = enumArguments(parameter);
+        return enumOptions.isEmpty() ? List.of() : enumOptions;
+      }
+      if (parameter.isPrimitive()) {
+        return List.of();
+      }
+      return List.of();
+    }
+
+    private List<Object> enumArguments(Class<?> enumType) {
+      Object[] values = enumType.getEnumConstants();
+      if (values == null || values.length == 0) {
+        return List.of();
+      }
+      List<Object> prioritized = new ArrayList<>();
+      for (Object value : values) {
+        String name = value.toString().toLowerCase(Locale.ROOT);
+        if (name.contains("sell")) {
+          prioritized.add(value);
+        }
+      }
+      for (Object value : values) {
+        if (!prioritized.contains(value)) {
+          prioritized.add(value);
+        }
+      }
+      return prioritized;
     }
 
     private Optional<Plugin> findPlugin() {
@@ -404,8 +583,24 @@ public final class SellContainerService {
         if (found != null && found.isEnabled()) {
           return Optional.of(found);
         }
+        String wanted = normalizePluginName(pluginName);
+        for (Plugin candidate : Bukkit.getPluginManager().getPlugins()) {
+          if (!candidate.isEnabled()) {
+            continue;
+          }
+          String candidateName = normalizePluginName(candidate.getName());
+          if (candidateName.equals(wanted)
+              || candidateName.contains(wanted)
+              || wanted.contains(candidateName)) {
+            return Optional.of(candidate);
+          }
+        }
       }
       return Optional.empty();
+    }
+
+    private String normalizePluginName(String value) {
+      return value.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
     }
 
     private Optional<Class<?>> classForName(String className) {
@@ -414,6 +609,50 @@ public final class SellContainerService {
       } catch (ClassNotFoundException ex) {
         return Optional.empty();
       }
+    }
+
+    String diagnostics() {
+      String pluginSummary = findPlugin()
+          .map(found -> "plugin=" + found.getName())
+          .orElse("plugin=not-detected");
+      List<String> foundClasses = classCandidates.stream()
+          .filter(className -> classForName(className).isPresent())
+          .collect(Collectors.toList());
+      if (foundClasses.isEmpty()) {
+        return pluginSummary + ", api-classes=none";
+      }
+      List<String> methodSummaries = new ArrayList<>();
+      for (String className : foundClasses) {
+        Optional<Class<?>> resolved = classForName(className);
+        if (resolved.isEmpty()) {
+          continue;
+        }
+        List<String> methods = new ArrayList<>();
+        for (Method method : resolved.get().getMethods()) {
+          String methodName = method.getName().toLowerCase(Locale.ROOT);
+          boolean candidate = methodCandidates.stream()
+              .map(name -> name.toLowerCase(Locale.ROOT))
+              .anyMatch(methodName::equals)
+              || (methodName.contains("sell")
+                  && (methodName.endsWith("price")
+                      || methodName.endsWith("value")
+                      || methodName.endsWith("worth")));
+          if (candidate) {
+            String signature = java.util.Arrays.stream(method.getParameterTypes())
+                .map(Class::getSimpleName)
+                .collect(Collectors.joining(","));
+            methods.add(method.getName() + "(" + signature + ")");
+          }
+        }
+        if (!methods.isEmpty()) {
+          methodSummaries.add(className + ":" + String.join(",", methods));
+        }
+      }
+      if (methodSummaries.isEmpty()) {
+        return pluginSummary + ", api-classes=" + String.join(",", foundClasses)
+            + ", candidate-methods=none";
+      }
+      return pluginSummary + ", candidates=" + String.join(" | ", methodSummaries);
     }
   }
 
@@ -659,8 +898,32 @@ public final class SellContainerService {
       // Ignore.
     }
     try {
+      Method method = source.getClass().getMethod("getSellPrice");
+      return extractPrice(method.invoke(source));
+    } catch (ReflectiveOperationException ignored) {
+      // Ignore.
+    }
+    try {
       Method method = source.getClass().getMethod("getValue");
       return extractPrice(method.invoke(source));
+    } catch (ReflectiveOperationException ignored) {
+      // Ignore.
+    }
+    try {
+      Field field = source.getClass().getField("price");
+      return extractPrice(field.get(source));
+    } catch (ReflectiveOperationException ignored) {
+      // Ignore.
+    }
+    try {
+      Field field = source.getClass().getField("sellPrice");
+      return extractPrice(field.get(source));
+    } catch (ReflectiveOperationException ignored) {
+      // Ignore.
+    }
+    try {
+      Field field = source.getClass().getField("value");
+      return extractPrice(field.get(source));
     } catch (ReflectiveOperationException ignored) {
       // Ignore.
     }

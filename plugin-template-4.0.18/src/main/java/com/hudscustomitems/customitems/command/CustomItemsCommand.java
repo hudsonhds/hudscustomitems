@@ -573,6 +573,19 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
         values.add(name);
       }
     }
+    for (Material material : Material.values()) {
+      if (!material.isBlock()) {
+        continue;
+      }
+      String name = material.name();
+      if (name.toLowerCase(Locale.ROOT).startsWith(lower)) {
+        values.add(name);
+      }
+      String prefixed = "BLOCK:" + name;
+      if (prefixed.toLowerCase(Locale.ROOT).startsWith(lower)) {
+        values.add(prefixed);
+      }
+    }
     return values;
   }
 

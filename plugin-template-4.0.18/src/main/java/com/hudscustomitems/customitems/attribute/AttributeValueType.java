@@ -102,11 +102,16 @@ public enum AttributeValueType {
   PARTICLE("particle key") {
     @Override
     public boolean isValid(String value) {
+      String normalized = value.trim().toUpperCase();
       try {
-        Particle.valueOf(value.trim().toUpperCase());
+        Particle.valueOf(normalized);
         return true;
       } catch (IllegalArgumentException ex) {
-        return false;
+        String materialName = normalized.startsWith("BLOCK:")
+            ? normalized.substring("BLOCK:".length())
+            : normalized;
+        Material material = parseMaterial(materialName);
+        return material != null && material.isBlock();
       }
     }
   },
