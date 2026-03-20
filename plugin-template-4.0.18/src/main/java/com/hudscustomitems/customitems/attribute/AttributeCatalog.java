@@ -234,12 +234,17 @@ public final class AttributeCatalog {
         AttributeValueType.BOOLEAN, "Only original owner can use.");
     register("soulbound", "Soulbound", AttributeCategory.RESTRICTION,
         AttributeValueType.BOOLEAN, "Cannot be dropped or traded.");
+    register("infinite", "Infinite", AttributeCategory.RESTRICTION,
+        AttributeValueType.BOOLEAN,
+        "Allows normal usage while preventing drop and bundle transfer.");
     register("prevent_placement", "Prevent Placement", AttributeCategory.RESTRICTION,
         AttributeValueType.BOOLEAN, "Prevents this custom item from being placed as a block.");
     register("prevent_eating", "Prevent Eating", AttributeCategory.RESTRICTION,
         AttributeValueType.BOOLEAN, "Prevents this custom item from being eaten.");
     register("prevent_feeding", "Prevent Feeding", AttributeCategory.RESTRICTION,
         AttributeValueType.BOOLEAN, "Prevents this custom item from being fed to animals.");
+    register("prevent_bundle", "Prevent Bundle", AttributeCategory.RESTRICTION,
+        AttributeValueType.BOOLEAN, "Prevents this custom item from being used with bundles.");
     register("upgradeable", "Upgradeable", AttributeCategory.RESTRICTION,
         AttributeValueType.BOOLEAN, "Can gain new levels and stats.");
   }

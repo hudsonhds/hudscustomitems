@@ -47,6 +47,7 @@ import org.bukkit.event.enchantment.PrepareItemEnchantEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryAction;
 import org.bukkit.event.inventory.InventoryType;
 import org.bukkit.event.inventory.PrepareAnvilEvent;
 import org.bukkit.event.inventory.PrepareGrindstoneEvent;
@@ -128,6 +129,7 @@ public final class CustomItemListener implements Listener {
         continue;
       }
       Map<String, String> attributes = itemService.resolveAttributes(held);
+      applyMagnetModes(player, attributes);
       applyTrailParticles(player, attributes);
       applyBlockHighlighting(player, attributes);
       applyMobDetection(player, attributes);
@@ -465,6 +467,11 @@ public final class CustomItemListener implements Listener {
       return;
     }
     Map<String, String> attributes = itemService.resolveAttributes(dropped);
+    if (itemService.boolValue(attributes, "infinite")) {
+      event.setCancelled(true);
+      event.getPlayer().sendMessage(color("&cInfinite items cannot be dropped."));
+      return;
+    }
     if (itemService.boolValue(attributes, "soulbound")) {
       event.setCancelled(true);
       event.getPlayer().sendMessage(color("&cSoulbound items cannot be dropped."));
@@ -477,17 +484,24 @@ public final class CustomItemListener implements Listener {
     if (itemService.customItemId(consumed).isEmpty()) {
       return;
     }
+    Player player = event.getPlayer();
     Map<String, String> attributes = itemService.resolveAttributes(consumed);
+    if (itemService.boolValue(attributes, "infinite")) {
+      ItemStack snapshot = resolveHandSnapshot(player, event.getHand(), consumed);
+      scheduleInfiniteRestore(player, event.getHand(), snapshot);
+      return;
+    }
     if (!isPreventedByDefault(attributes, "prevent_eating")) {
       return;
     }
     event.setCancelled(true);
-    event.getPlayer().sendMessage(color("&cThis custom item cannot be eaten."));
+    player.sendMessage(color("&cThis custom item cannot be eaten."));
   }
 
   @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
   public void onEntityFeed(PlayerInteractEntityEvent event) {
-    ItemStack used = event.getPlayer().getInventory().getItem(event.getHand());
+    Player player = event.getPlayer();
+    ItemStack used = player.getInventory().getItem(event.getHand());
     if (itemService.customItemId(used).isEmpty()) {
       return;
     }
@@ -496,11 +510,15 @@ public final class CustomItemListener implements Listener {
       return;
     }
     Map<String, String> attributes = itemService.resolveAttributes(used);
+    if (itemService.boolValue(attributes, "infinite")) {
+      scheduleInfiniteRestore(player, event.getHand(), used);
+      return;
+    }
     if (!isPreventedByDefault(attributes, "prevent_feeding")) {
       return;
     }
     event.setCancelled(true);
-    event.getPlayer().sendMessage(color("&cThis custom item cannot be fed to animals."));
+    player.sendMessage(color("&cThis custom item cannot be fed to animals."));
   }
 
   @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
@@ -510,6 +528,10 @@ public final class CustomItemListener implements Listener {
       return;
     }
     Map<String, String> attributes = itemService.resolveAttributes(placed);
+    if (itemService.boolValue(attributes, "infinite")) {
+      scheduleInfiniteRestore(event.getPlayer(), event.getHand(), placed);
+      return;
+    }
     if (!isPreventedByDefault(attributes, "prevent_placement")) {
       return;
     }
@@ -569,6 +591,13 @@ public final class CustomItemListener implements Listener {
       event.setCancelled(true);
       if (event.getWhoClicked() instanceof Player player) {
         player.sendMessage(color("&cCustom items are unmodifiable."));
+      }
+      return;
+    }
+    if (isPreventedBundleInteraction(event)) {
+      event.setCancelled(true);
+      if (event.getWhoClicked() instanceof Player player) {
+        player.sendMessage(color("&cThis custom item cannot be used with bundles."));
       }
       return;
     }
@@ -963,10 +992,10 @@ public final class CustomItemListener implements Listener {
       return;
     }
     Location base = player.getLocation();
-    int radius = 8;
+    int radius = 20;
     int highlighted = 0;
     for (int x = -radius; x <= radius && highlighted < 48; x++) {
-      for (int y = -4; y <= 4 && highlighted < 48; y++) {
+      for (int y = -3; y <= 4 && highlighted < 48; y++) {
         for (int z = -radius; z <= radius && highlighted < 48; z++) {
           Block block = base.getBlock().getRelative(x, y, z);
           if (isValuable(block.getType())) {
@@ -995,27 +1024,34 @@ public final class CustomItemListener implements Listener {
   }
 
   private void applyMagnetModes(Player player, Map<String, String> attributes) {
-    boolean magnetMode = itemService.boolValue(attributes, "magnet_mode");
+    boolean vacuumTuned = attributes.containsKey("item_vacuum_radius")
+        || attributes.containsKey("item_vacuum_pull_radius");
+    boolean magnetMode = itemService.boolValue(attributes, "magnet_mode") || vacuumTuned;
     boolean autoPickup = itemService.boolValue(attributes, "auto_pickup");
     boolean xpMagnet = itemService.boolValue(attributes, "xp_magnet");
     double radius = itemService.doubleValue(attributes, "item_vacuum_radius")
         .orElse(plugin.getConfig().getDouble("default-item-vacuum-radius", 6.0));
-    double pullStrength = itemService.doubleValue(attributes, "item_vacuum_pull_radius")
+    double configuredPull = itemService.doubleValue(attributes, "item_vacuum_pull_radius")
         .orElse(plugin.getConfig().getDouble("default-item-vacuum-pull-radius", 0.28));
+    if (!attributes.containsKey("item_vacuum_radius") && attributes.containsKey("item_vacuum_pull_radius")
+        && configuredPull > radius) {
+      radius = configuredPull;
+    }
+    double pullStrength = Math.max(0.02, Math.min(2.0, configuredPull));
     if (!magnetMode && !autoPickup && !xpMagnet) {
       return;
     }
     for (Entity entity : player.getNearbyEntities(radius, radius, radius)) {
       if (entity instanceof Item item) {
         if (autoPickup) {
-          HashMap<Integer, ItemStack> overflow = player.getInventory().addItem(item.getItemStack());
-          if (overflow.isEmpty()) {
-            item.remove();
-          }
+          tryPickupItem(player, item);
         } else if (magnetMode) {
-          Vector velocity = player.getLocation().toVector().subtract(item.getLocation().toVector())
-              .normalize().multiply(pullStrength);
-          item.setVelocity(velocity);
+          Vector delta = player.getLocation().toVector().subtract(item.getLocation().toVector());
+          if (delta.lengthSquared() <= 2.25) {
+            tryPickupItem(player, item);
+          } else {
+            item.setVelocity(delta.normalize().multiply(pullStrength));
+          }
         }
       }
       if (xpMagnet && entity instanceof ExperienceOrb orb) {
@@ -1036,6 +1072,23 @@ public final class CustomItemListener implements Listener {
       player.setVelocity(velocity);
       player.setFallDistance(0.0f);
     }
+  }
+
+  private void tryPickupItem(Player player, Item item) {
+    HashMap<Integer, ItemStack> overflow = player.getInventory().addItem(item.getItemStack());
+    if (overflow.isEmpty()) {
+      item.remove();
+      return;
+    }
+    ItemStack original = item.getItemStack();
+    int remainingAmount = overflow.values()
+        .stream()
+        .mapToInt(ItemStack::getAmount)
+        .sum();
+    int clampedAmount = Math.max(1, Math.min(original.getAmount(), remainingAmount));
+    ItemStack remaining = original.clone();
+    remaining.setAmount(clampedAmount);
+    item.setItemStack(remaining);
   }
 
   private void updateDoubleJumpState(Player player, Map<String, String> attributes) {
@@ -1773,6 +1826,85 @@ public final class CustomItemListener implements Listener {
       }
     }
     return false;
+  }
+
+  private boolean isPreventedBundleInteraction(InventoryClickEvent event) {
+    if (!isBundleInteraction(event)) {
+      return false;
+    }
+    ItemStack current = event.getCurrentItem();
+    ItemStack cursor = event.getCursor();
+    if (hasPreventBundleEnabled(current) || hasPreventBundleEnabled(cursor)) {
+      return true;
+    }
+    int hotbar = event.getHotbarButton();
+    if (hotbar >= 0 && hotbar < event.getWhoClicked().getInventory().getSize()) {
+      ItemStack hotbarItem = event.getWhoClicked().getInventory().getItem(hotbar);
+      if (hasPreventBundleEnabled(hotbarItem)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private boolean isBundleInteraction(InventoryClickEvent event) {
+    InventoryAction action = event.getAction();
+    if (action != null && action.name().contains("BUNDLE")) {
+      return true;
+    }
+    ItemStack current = event.getCurrentItem();
+    ItemStack cursor = event.getCursor();
+    if (!isAirOrNull(current) && current.getType() == Material.BUNDLE) {
+      return true;
+    }
+    if (!isAirOrNull(cursor) && cursor.getType() == Material.BUNDLE) {
+      return true;
+    }
+    int hotbar = event.getHotbarButton();
+    if (hotbar >= 0 && hotbar < event.getWhoClicked().getInventory().getSize()) {
+      ItemStack hotbarItem = event.getWhoClicked().getInventory().getItem(hotbar);
+      return !isAirOrNull(hotbarItem) && hotbarItem.getType() == Material.BUNDLE;
+    }
+    return false;
+  }
+
+  private boolean hasPreventBundleEnabled(ItemStack stack) {
+    if (isAirOrNull(stack) || itemService.customItemId(stack).isEmpty()) {
+      return false;
+    }
+    Map<String, String> attributes = itemService.resolveAttributes(stack);
+    return itemService.boolValue(attributes, "infinite")
+        || isPreventedByDefault(attributes, "prevent_bundle");
+  }
+
+  private boolean isAirOrNull(ItemStack stack) {
+    return stack == null || stack.getType() == Material.AIR;
+  }
+
+  private ItemStack resolveHandSnapshot(Player player, EquipmentSlot hand, ItemStack fallback) {
+    ItemStack inHand = player.getInventory().getItem(hand);
+    if (!isAirOrNull(inHand)) {
+      return inHand.clone();
+    }
+    return fallback.clone();
+  }
+
+  private void scheduleInfiniteRestore(Player player, EquipmentSlot hand, ItemStack snapshot) {
+    if (hand != EquipmentSlot.HAND && hand != EquipmentSlot.OFF_HAND) {
+      return;
+    }
+    ItemStack restored = snapshot.clone();
+    Bukkit.getScheduler().runTask(plugin, () -> {
+      if (!player.isOnline()) {
+        return;
+      }
+      if (hand == EquipmentSlot.OFF_HAND) {
+        player.getInventory().setItemInOffHand(restored);
+      } else {
+        player.getInventory().setItemInMainHand(restored);
+      }
+      itemService.synchronizeInventory(player);
+    });
   }
 
   private Player resolveAttacker(Entity damager) {

@@ -35,6 +35,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
+import org.bukkit.inventory.meta.BundleMeta;
 import org.bukkit.inventory.meta.Damageable;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataContainer;
@@ -540,7 +541,9 @@ public final class CustomItemService {
    */
   public boolean consumeUse(Player player, ItemStack stack) {
     Map<String, String> attributes = resolveAttributes(stack);
-    if (attributes.isEmpty() || isMarkedUnbreakable(attributes)) {
+    if (attributes.isEmpty()
+        || isMarkedUnbreakable(attributes)
+        || boolValue(attributes, "infinite")) {
       return true;
     }
     int cost = Math.max(1, intValue(attributes, "durability_cost_per_use").orElse(1));
@@ -665,6 +668,7 @@ public final class CustomItemService {
     if (existingMeta == null) {
       return false;
     }
+    List<ItemStack> preservedBundleItems = readBundleItems(existingMeta);
     Integer vanillaDamage = null;
     if (existingMeta instanceof Damageable existingDamageable) {
       vanillaDamage = existingDamageable.getDamage();
@@ -717,6 +721,9 @@ public final class CustomItemService {
           rebuilt.getType().getMaxDurability(),
           isMarkedUnbreakable(rebuiltAttributes));
       finalDamageable.setDamage(preservedDamage);
+    }
+    if (finalMeta instanceof BundleMeta finalBundleMeta) {
+      writeBundleItems(finalBundleMeta, preservedBundleItems);
     }
     stack.setItemMeta(finalMeta);
     return true;
@@ -771,6 +778,20 @@ public final class CustomItemService {
     }
     int upperBound = Math.max(0, maxDurability);
     return Math.max(0, Math.min(rawDamage, upperBound));
+  }
+
+  private List<ItemStack> readBundleItems(ItemMeta meta) {
+    if (!(meta instanceof BundleMeta bundleMeta)) {
+      return List.of();
+    }
+    return bundleMeta.getItems()
+        .stream()
+        .map(ItemStack::clone)
+        .collect(Collectors.toList());
+  }
+
+  private void writeBundleItems(BundleMeta bundleMeta, List<ItemStack> items) {
+    bundleMeta.setItems(items.stream().map(ItemStack::clone).collect(Collectors.toList()));
   }
 
   /**
