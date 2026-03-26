@@ -8,6 +8,8 @@ import com.hudscustomitems.customitems.attribute.AttributeValueType;
 import com.hudscustomitems.customitems.model.CustomItemDefinition;
 import com.hudscustomitems.customitems.service.ConfigUpdater;
 import com.hudscustomitems.customitems.service.CustomItemService;
+import com.hudscustomitems.customitems.service.TelemetryService;
+import com.hudscustomitems.customitems.service.TelemetryService.Subsystem;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
@@ -19,8 +21,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
-import org.bukkit.ChatColor;
 import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
 import org.bukkit.Material;
 import org.bukkit.Particle;
 import org.bukkit.Sound;
@@ -39,16 +41,22 @@ import org.bukkit.plugin.java.JavaPlugin;
 public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
   private final JavaPlugin plugin;
   private final CustomItemService itemService;
+  private final TelemetryService telemetryService;
 
   /**
    * Creates command handler.
    *
    * @param plugin owner plugin
    * @param itemService service instance
+   * @param telemetryService telemetry service
    */
-  public CustomItemsCommand(JavaPlugin plugin, CustomItemService itemService) {
+  public CustomItemsCommand(
+      JavaPlugin plugin,
+      CustomItemService itemService,
+      TelemetryService telemetryService) {
     this.plugin = plugin;
     this.itemService = itemService;
+    this.telemetryService = telemetryService;
   }
 
   @Override
@@ -59,20 +67,30 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
     }
     if (!hasAdminAccess(sender)) {
       sender.sendMessage(color("&cYou do not have permission."));
+      recordCommandFailure("no_permission");
       return true;
     }
-    String sub = args[0].toLowerCase(Locale.ROOT);
-    switch (sub) {
-      case "create" -> handleCreate(sender, args);
-      case "edit" -> handleEdit(sender, args);
-      case "remove" -> handleRemove(sender, args);
-      case "give" -> handleGive(sender, args);
-      case "reload" -> handleReload(sender);
-      case "list" -> handleList(sender);
-      case "attributes", "attrs" -> handleAttributes(sender, args);
-      case "inspect" -> handleInspect(sender, args);
-      case "oneoff" -> handleOneOff(sender, args);
-      default -> sendHelp(sender, label);
+    try {
+      String sub = args[0].toLowerCase(Locale.ROOT);
+      switch (sub) {
+        case "create" -> handleCreate(sender, args);
+        case "edit" -> handleEdit(sender, args);
+        case "remove" -> handleRemove(sender, args);
+        case "give" -> handleGive(sender, args);
+        case "reload" -> handleReload(sender);
+        case "list" -> handleList(sender);
+        case "attributes", "attrs" -> handleAttributes(sender, args);
+        case "inspect" -> handleInspect(sender, args);
+        case "oneoff" -> handleOneOff(sender, args);
+        default -> {
+          recordCommandFailure("unknown_subcommand");
+          sendHelp(sender, label);
+        }
+      }
+    } catch (Throwable throwable) {
+      telemetryService.recordException(Subsystem.COMMAND, "command_exception", throwable);
+      recordCommandFailure("command_exception");
+      sender.sendMessage(color("&cAn internal error occurred while running this command."));
     }
     return true;
   }
@@ -185,22 +203,26 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
       sender.sendMessage(color("&cUsage: /customitems create <id> <material> <display_name>"
           + " [attribute value]..."));
       sender.sendMessage(color("&7Use /customitems edit <id> name <multi word name> afterwards."));
+      recordCommandFailure("create_usage");
       return;
     }
     String id = args[1].toLowerCase(Locale.ROOT);
     if (itemService.definition(id).isPresent()) {
       sender.sendMessage(color("&cThat id already exists."));
+      recordCommandFailure("create_id_exists");
       return;
     }
     Material material = parseMaterial(args[2]);
     if (material == null) {
       sender.sendMessage(color("&cInvalid material."));
+      recordItemParseFailure("create_invalid_material");
       return;
     }
     String displayName = args[3];
     if ((args.length - 4) % 2 != 0) {
       sender.sendMessage(color("&cAttributes must be provided as pairs:"
           + " <attribute> <value> <attribute> <value> ..."));
+      recordItemParseFailure("create_attribute_pair_invalid");
       return;
     }
     Map<String, String> pendingAttributes = new LinkedHashMap<>();
@@ -210,11 +232,13 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
       Optional<AttributeDefinition> definition = AttributeCatalog.byId(attributeId);
       if (definition.isEmpty()) {
         sender.sendMessage(color("&cUnknown attribute '&f" + attributeId + "&c'."));
+        recordItemParseFailure("create_unknown_attribute");
         return;
       }
       if (!definition.get().valueType().isValid(value)) {
         sender.sendMessage(color("&cInvalid value for '&f" + attributeId + "&c'. Expected "
             + definition.get().valueType().example()));
+        recordItemParseFailure("create_invalid_attribute_value");
         return;
       }
       pendingAttributes.put(attributeId, value);
@@ -228,6 +252,7 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
       if (error.isPresent()) {
         itemService.removeDefinition(id);
         sender.sendMessage(color("&cFailed to create item: " + error.get()));
+        recordItemParseFailure("create_set_attribute_failed");
         return;
       }
     }
@@ -241,12 +266,14 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
   private void handleEdit(CommandSender sender, String[] args) {
     if (args.length < 4) {
       sender.sendMessage(color("&cUsage: /customitems edit <id> <field> <value...>"));
+      recordCommandFailure("edit_usage");
       return;
     }
     String id = args[1];
     Optional<CustomItemDefinition> optionalDefinition = itemService.definition(id);
     if (optionalDefinition.isEmpty()) {
       sender.sendMessage(color("&cUnknown id."));
+      recordCommandFailure("edit_unknown_id");
       return;
     }
     String field = args[2].toLowerCase(Locale.ROOT);
@@ -260,6 +287,7 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
         Material material = parseMaterial(args[3]);
         if (material == null) {
           sender.sendMessage(color("&cInvalid material."));
+          recordItemParseFailure("edit_invalid_material");
           return;
         }
         itemService.setMaterial(id, material);
@@ -281,6 +309,7 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
         Optional<String> error = itemService.setDefinitionAttribute(id, attributeId, value);
         if (error.isPresent()) {
           sender.sendMessage(color("&c" + error.get()));
+          recordItemParseFailure("edit_set_attribute_failed");
           return;
         }
         sender.sendMessage(color("&aSet &f" + attributeId + "&a on &f" + id));
@@ -294,7 +323,10 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
         }
         sender.sendMessage(color("&aRemoved attribute &f" + attributeId));
       }
-      default -> sender.sendMessage(color("&cUnknown field. Use name/material/lore/setattr/delattr"));
+      default -> {
+        sender.sendMessage(color("&cUnknown field. Use name/material/lore/setattr/delattr"));
+        recordCommandFailure("edit_unknown_field");
+      }
     }
   }
 
@@ -314,11 +346,13 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
   private void handleGive(CommandSender sender, String[] args) {
     if (args.length < 3) {
       sender.sendMessage(color("&cUsage: /customitems give <player> <id> [amount]"));
+      telemetryService.recordGiveFailure("give_usage");
       return;
     }
     Player target = Bukkit.getPlayerExact(args[1]);
     if (target == null) {
       sender.sendMessage(color("&cPlayer not found."));
+      telemetryService.recordGiveFailure("give_player_missing");
       return;
     }
     int amount = 1;
@@ -327,36 +361,46 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
         amount = Math.max(1, Integer.parseInt(args[3]));
       } catch (NumberFormatException ex) {
         sender.sendMessage(color("&cAmount must be a number."));
+        telemetryService.recordGiveFailure("give_amount_invalid");
         return;
       }
     }
     Optional<ItemStack> stack = itemService.createStack(args[2], amount, target.getUniqueId());
     if (stack.isEmpty()) {
       sender.sendMessage(color("&cUnknown item id."));
+      telemetryService.recordGiveFailure("give_unknown_item");
       return;
     }
     target.getInventory().addItem(stack.get());
     sender.sendMessage(color("&aGave &f" + amount + "x " + args[2] + "&a to &f" + target.getName()));
+    telemetryService.recordGiveSuccess();
   }
 
   private void handleReload(CommandSender sender) {
-    ConfigUpdater.UpdateSummary summary;
-    if (plugin instanceof CustomItemsPlugin customItemsPlugin) {
-      summary = customItemsPlugin.reloadConfigWithUpdate();
-    } else {
-      plugin.reloadConfig();
-      summary = new ConfigUpdater.UpdateSummary(false, 0, false, false, null);
+    try {
+      ConfigUpdater.UpdateSummary summary;
+      if (plugin instanceof CustomItemsPlugin customItemsPlugin) {
+        summary = customItemsPlugin.reloadConfigWithUpdate();
+      } else {
+        plugin.reloadConfig();
+        summary = new ConfigUpdater.UpdateSummary(false, 0, false, false, null);
+      }
+      itemService.reloadDefinitions();
+      telemetryService.recordConfigReloadSuccess();
+      if (!summary.changed()) {
+        sender.sendMessage(color("&aReloaded config.yml and items.yml (no config changes)."));
+        return;
+      }
+      String backupPart = summary.backupPath() == null
+          ? ""
+          : " &7(backup: &f" + summary.backupPath() + "&7)";
+      sender.sendMessage(color("&aReloaded config.yml and items.yml. Added &f"
+          + summary.addedKeys() + "&a missing config key(s)." + backupPart));
+    } catch (Throwable throwable) {
+      telemetryService.recordConfigReloadFailure("reload_failed", throwable);
+      recordCommandFailure("reload_failed");
+      sender.sendMessage(color("&cReload failed. Check console for details."));
     }
-    itemService.reloadDefinitions();
-    if (!summary.changed()) {
-      sender.sendMessage(color("&aReloaded config.yml and items.yml (no config changes)."));
-      return;
-    }
-    String backupPart = summary.backupPath() == null
-        ? ""
-        : " &7(backup: &f" + summary.backupPath() + "&7)";
-    sender.sendMessage(color("&aReloaded config.yml and items.yml. Added &f"
-        + summary.addedKeys() + "&a missing config key(s)." + backupPart));
   }
 
   private void handleList(CommandSender sender) {
@@ -455,6 +499,7 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
         Optional<String> error = itemService.setOneTimeAttribute(held, attribute, value);
         if (error.isPresent()) {
           sender.sendMessage(color("&c" + error.get()));
+          recordItemParseFailure("oneoff_set_failed");
           return;
         }
         sender.sendMessage(color("&aApplied one-time attribute &f" + attribute));
@@ -661,5 +706,14 @@ public final class CustomItemsCommand implements CommandExecutor, TabCompleter {
     sender.sendMessage(color("&7/" + label + " inspect [player]"));
     sender.sendMessage(color("&7/" + label + " oneoff add|remove|clear|list ..."));
     sender.sendMessage(color("&7/" + label + " reload"));
+  }
+
+  private void recordCommandFailure(String code) {
+    telemetryService.recordCommandFailure(code);
+  }
+
+  private void recordItemParseFailure(String code) {
+    telemetryService.recordItemParseFailure(code);
+    telemetryService.recordCommandFailure(code);
   }
 }

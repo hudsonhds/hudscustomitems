@@ -37,18 +37,31 @@ public final class ItemStorage {
    * @return map keyed by id
    */
   public Map<String, CustomItemDefinition> loadDefinitions() {
+    return loadDefinitionsWithStats().definitions();
+  }
+
+  /**
+   * Loads all item definitions from disk with load diagnostics.
+   *
+   * @return load result
+   */
+  public LoadResult loadDefinitionsWithStats() {
     YamlConfiguration configuration = YamlConfiguration.loadConfiguration(file);
     Map<String, CustomItemDefinition> loaded = new LinkedHashMap<>();
     ConfigurationSection itemSection = configuration.getConfigurationSection("items");
     if (itemSection == null) {
-      return loaded;
+      return new LoadResult(loaded, 0, 0);
     }
+    int failed = 0;
+    int total = 0;
     for (String id : itemSection.getKeys(false)) {
+      total++;
       String base = "items." + id + ".";
       String materialName = configuration.getString(base + "material", "STONE");
       Material material = parseMaterial(materialName);
       if (material == null) {
         plugin.getLogger().warning("Skipping item '" + id + "', invalid material: " + materialName);
+        failed++;
         continue;
       }
       String displayName = configuration.getString(base + "display-name", id);
@@ -64,7 +77,7 @@ public final class ItemStorage {
       loaded.put(normalized,
           new CustomItemDefinition(normalized, material, displayName, lore, attributes));
     }
-    return loaded;
+    return new LoadResult(loaded, total, failed);
   }
 
   /**
@@ -105,5 +118,18 @@ public final class ItemStorage {
     } catch (IllegalArgumentException ex) {
       return null;
     }
+  }
+
+  /**
+   * Immutable definition load summary.
+   *
+   * @param definitions parsed definitions keyed by id
+   * @param totalDefinitions total entries found in items.yml
+   * @param failedDefinitions entries skipped due to invalid data
+   */
+  public record LoadResult(
+      Map<String, CustomItemDefinition> definitions,
+      int totalDefinitions,
+      int failedDefinitions) {
   }
 }

@@ -58,6 +58,8 @@ public final class CustomItemService {
   private final Map<String, CustomItemDefinition> definitions;
   private final Map<String, Long> cooldowns;
   private final Map<String, Long> chargeStarts;
+  private volatile int loadedDefinitionCount;
+  private volatile int failedDefinitionLoadCount;
   private final NamespacedKey itemIdKey;
   private final NamespacedKey oneTimeAttributesKey;
   private final NamespacedKey ownerUuidKey;
@@ -91,7 +93,28 @@ public final class CustomItemService {
    */
   public void reloadDefinitions() {
     definitions.clear();
-    definitions.putAll(itemStorage.loadDefinitions());
+    ItemStorage.LoadResult result = itemStorage.loadDefinitionsWithStats();
+    definitions.putAll(result.definitions());
+    loadedDefinitionCount = result.definitions().size();
+    failedDefinitionLoadCount = result.failedDefinitions();
+  }
+
+  /**
+   * Gets number of successfully loaded definitions from the last reload.
+   *
+   * @return loaded definition count
+   */
+  public int loadedDefinitionCount() {
+    return loadedDefinitionCount;
+  }
+
+  /**
+   * Gets number of failed definitions from the last reload.
+   *
+   * @return failed definition count
+   */
+  public int failedDefinitionLoadCount() {
+    return failedDefinitionLoadCount;
   }
 
   /**

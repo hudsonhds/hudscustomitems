@@ -1,4 +1,4 @@
-config-version: 2
+config-version: 3
 permission-node: customitems.admin
 use-permission-node: customitems.use
 send-ability-messages: true
@@ -8,6 +8,16 @@ default-break-radius: 0
 default-item-vacuum-radius: 6
 default-item-vacuum-pull-radius: 0.28
 mob-detection-radius: 22
+drop-confirmation:
+  enabled: false
+  window-seconds: 3
+metrics:
+  faststats:
+    enabled: true
+    error-reporting: true
+    error-report-dedup-window-seconds: 120
+    periodic-interval-seconds: 300
+    recent-event-buffer-size: 50
 attribute-display:
   enabled: true
   show-unmodifiable-tag: true

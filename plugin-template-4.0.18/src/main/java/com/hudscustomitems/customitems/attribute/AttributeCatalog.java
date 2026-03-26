@@ -236,7 +236,7 @@ public final class AttributeCatalog {
         AttributeValueType.BOOLEAN, "Cannot be dropped or traded.");
     register("infinite", "Infinite", AttributeCategory.RESTRICTION,
         AttributeValueType.BOOLEAN,
-        "Allows normal usage while preventing drop and bundle transfer.");
+        "Allows normal usage while preventing bundle transfer.");
     register("prevent_placement", "Prevent Placement", AttributeCategory.RESTRICTION,
         AttributeValueType.BOOLEAN, "Prevents this custom item from being placed as a block.");
     register("prevent_eating", "Prevent Eating", AttributeCategory.RESTRICTION,

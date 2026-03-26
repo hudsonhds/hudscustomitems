@@ -21,6 +21,7 @@ import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.Particle;
 import org.bukkit.Sound;
+import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.block.Container;
@@ -45,6 +46,7 @@ import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.enchantment.EnchantItemEvent;
 import org.bukkit.event.enchantment.PrepareItemEnchantEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityDamageEvent.DamageCause;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryAction;
@@ -80,6 +82,10 @@ import org.bukkit.util.Vector;
 public final class CustomItemListener implements Listener {
   private static final int POTION_DURATION_TICKS = 15 * 20;
   private static final long POTION_REFRESH_INTERVAL_MS = 5_000L;
+  private static final int defaultDropConfirmWindowSeconds = 3;
+  private static final double minExplosionPower = 0.1;
+  private static final double maxExplosionPower = 8.0;
+  private static final int maxFreezeSeconds = 30;
   private final JavaPlugin plugin;
   private final CustomItemService itemService;
   private final SellContainerService sellContainerService;
@@ -90,6 +96,7 @@ public final class CustomItemListener implements Listener {
   private final Map<UUID, Long> movementThrottle;
   private final Map<UUID, Long> dashTriggerTimes;
   private final Map<UUID, Long> potionRefreshTimes;
+  private final Map<UUID, PendingDropConfirmation> pendingDropConfirmations;
   private final Map<UUID, Set<PotionEffectType>> managedPotionEffects;
 
   /**
@@ -100,9 +107,9 @@ public final class CustomItemListener implements Listener {
    * @param sellContainerService sell container service
    */
   public CustomItemListener(
-      JavaPlugin plugin,
-      CustomItemService itemService,
-      SellContainerService sellContainerService) {
+          JavaPlugin plugin,
+          CustomItemService itemService,
+          SellContainerService sellContainerService) {
     this.plugin = plugin;
     this.itemService = itemService;
     this.sellContainerService = sellContainerService;
@@ -113,6 +120,7 @@ public final class CustomItemListener implements Listener {
     this.movementThrottle = new HashMap<>();
     this.dashTriggerTimes = new HashMap<>();
     this.potionRefreshTimes = new HashMap<>();
+    this.pendingDropConfirmations = new HashMap<>();
     this.managedPotionEffects = new HashMap<>();
   }
 
@@ -178,7 +186,7 @@ public final class CustomItemListener implements Listener {
       }
     }
     boolean replantMain = itemService.boolValue(attributes, "auto_replant")
-        && isHarvestableCrop(event.getBlock());
+            && isHarvestableCrop(event.getBlock());
     Material mainCropType = event.getBlock().getType();
     String locationKey = locationKey(event.getBlock().getLocation());
     if (breakGuard.contains(locationKey)) {
@@ -188,14 +196,14 @@ public final class CustomItemListener implements Listener {
       event.setDropItems(false);
     }
     spawnConfiguredParticle(
-        player,
-        attributes.get("mining_particles"),
-        event.getBlock().getLocation().add(0.5, 0.6, 0.5),
-        18,
-        0.35,
-        0.35,
-        0.35,
-        0.02);
+            player,
+            attributes.get("mining_particles"),
+            event.getBlock().getLocation().add(0.5, 0.6, 0.5),
+            18,
+            0.35,
+            0.35,
+            0.35,
+            0.02);
     Set<Block> extra = collectExtraBlocks(event.getBlock(), player, attributes);
     if (!extra.isEmpty()) {
       for (Block block : extra) {
@@ -206,7 +214,7 @@ public final class CustomItemListener implements Listener {
           continue;
         }
         boolean replantExtra = itemService.boolValue(attributes, "auto_replant")
-            && isHarvestableCrop(block);
+                && isHarvestableCrop(block);
         Material cropType = block.getType();
         String key = locationKey(block.getLocation());
         breakGuard.add(key);
@@ -224,10 +232,10 @@ public final class CustomItemListener implements Listener {
   }
 
   private void breakExtraBlock(
-      Block block,
-      Player player,
-      ItemStack held,
-      Map<String, String> attributes) {
+          Block block,
+          Player player,
+          ItemStack held,
+          Map<String, String> attributes) {
     List<ItemStack> drops = new ArrayList<>(block.getDrops(held, player));
     block.setType(Material.AIR, false);
     if (itemService.boolValue(attributes, "no_block_drops")) {
@@ -298,9 +306,9 @@ public final class CustomItemListener implements Listener {
     Player player = event.getPlayer();
     ItemStack held = player.getInventory().getItemInMainHand();
     if (held.getType() == Material.AIR
-        && player.isSneaking()
-        && (event.getHand() == EquipmentSlot.HAND || event.getHand() == EquipmentSlot.OFF_HAND)
-        && triggerSneakDash(player)) {
+            && player.isSneaking()
+            && (event.getHand() == EquipmentSlot.HAND || event.getHand() == EquipmentSlot.OFF_HAND)
+            && triggerSneakDash(player)) {
       event.setCancelled(true);
       return;
     }
@@ -388,6 +396,10 @@ public final class CustomItemListener implements Listener {
 
   @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
   public void onDamage(EntityDamageByEntityEvent event) {
+    if (event.getCause() == DamageCause.BLOCK_EXPLOSION
+            || event.getCause() == DamageCause.ENTITY_EXPLOSION) {
+      return;
+    }
     Player attacker = resolveAttacker(event.getDamager());
     if (attacker == null) {
       return;
@@ -452,10 +464,10 @@ public final class CustomItemListener implements Listener {
       player.setAllowFlight(false);
       double jumpMultiplier = jumpPercent / 100.0;
       Vector jump = player.getLocation().getDirection().multiply(0.7 * jumpMultiplier)
-          .setY(0.75 * jumpMultiplier);
+              .setY(0.75 * jumpMultiplier);
       player.setVelocity(player.getVelocity().add(jump));
       player.getWorld().spawnParticle(Particle.CLOUD, player.getLocation().add(0, 0.1, 0), 14, 0.3,
-          0.2, 0.3, 0.01);
+              0.2, 0.3, 0.01);
       itemService.consumeUse(player, source.stack());
     }
   }
@@ -463,19 +475,38 @@ public final class CustomItemListener implements Listener {
   @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
   public void onDrop(PlayerDropItemEvent event) {
     ItemStack dropped = event.getItemDrop().getItemStack();
-    if (itemService.customItemId(dropped).isEmpty()) {
+    Optional<String> customItemId = itemService.customItemId(dropped);
+    if (customItemId.isEmpty()) {
       return;
     }
     Map<String, String> attributes = itemService.resolveAttributes(dropped);
-    if (itemService.boolValue(attributes, "infinite")) {
-      event.setCancelled(true);
-      event.getPlayer().sendMessage(color("&cInfinite items cannot be dropped."));
-      return;
-    }
     if (itemService.boolValue(attributes, "soulbound")) {
       event.setCancelled(true);
       event.getPlayer().sendMessage(color("&cSoulbound items cannot be dropped."));
+      return;
     }
+    if (itemService.boolValue(attributes, "owner_bound")) {
+      event.setCancelled(true);
+      event.getPlayer().sendMessage(color("&cOwner-bound items cannot be dropped."));
+      return;
+    }
+    if (!isDropConfirmationEnabled()) {
+      pendingDropConfirmations.remove(event.getPlayer().getUniqueId());
+      return;
+    }
+    UUID playerId = event.getPlayer().getUniqueId();
+    long nowMs = System.currentTimeMillis();
+    int windowSeconds = configuredDropConfirmWindowSeconds();
+    PendingDropConfirmation pending = pendingDropConfirmations.get(playerId);
+    if (pending != null && pending.matches(customItemId.get(), nowMs)) {
+      pendingDropConfirmations.remove(playerId);
+      return;
+    }
+    event.setCancelled(true);
+    pendingDropConfirmations.put(playerId,
+        new PendingDropConfirmation(customItemId.get(), nowMs + (long) windowSeconds * 1000L));
+    event.getPlayer().sendMessage(color(
+        "&eDrop this custom item again within &f" + windowSeconds + "s&e to confirm."));
   }
 
   @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)
@@ -506,7 +537,7 @@ public final class CustomItemListener implements Listener {
       return;
     }
     if (!(event.getRightClicked() instanceof Animals)
-        && !(event.getRightClicked() instanceof AbstractHorse)) {
+            && !(event.getRightClicked() instanceof AbstractHorse)) {
       return;
     }
     Map<String, String> attributes = itemService.resolveAttributes(used);
@@ -610,8 +641,8 @@ public final class CustomItemListener implements Listener {
       return;
     }
     if (event.getClickedInventory() != null
-        && event.getWhoClicked() instanceof Player player
-        && event.getClickedInventory() != player.getInventory()) {
+            && event.getWhoClicked() instanceof Player player
+            && event.getClickedInventory() != player.getInventory()) {
       event.setCancelled(true);
     }
   }
@@ -643,25 +674,26 @@ public final class CustomItemListener implements Listener {
     UUID playerId = event.getPlayer().getUniqueId();
     dashTriggerTimes.remove(playerId);
     potionRefreshTimes.remove(playerId);
+    pendingDropConfirmations.remove(playerId);
     managedPotionEffects.remove(playerId);
   }
 
   private void useRightClickAbilities(Player player, ItemStack held, Map<String, String> attributes) {
     itemService.doubleValue(attributes, "teleport_on_right_click")
-        .ifPresent(distance -> teleportForward(player, distance));
+            .ifPresent(distance -> teleportForward(player, distance));
     itemService.doubleValue(attributes, "dash_ability").ifPresent(strength -> applyDash(player, strength));
     if (itemService.boolValue(attributes, "projectile_launch")
-        || attributes.containsKey("projectile_launch")) {
+            || attributes.containsKey("projectile_launch")) {
       launchConfiguredProjectile(player, attributes.get("projectile_launch"));
     }
     itemService.doubleValue(attributes, "area_ability").ifPresent(radius -> applyAreaAbility(player,
-        radius));
+            radius));
     itemService.doubleValue(attributes, "gravity_pull").ifPresent(radius -> pullNearbyEntities(
-        player, radius, 0.55));
-    itemService.doubleValue(attributes, "explosion_ability").ifPresent(power -> player.getWorld()
-        .createExplosion(player.getLocation(), power.floatValue(), false, false, player));
+            player, radius, 0.55));
+    itemService.doubleValue(attributes, "explosion_ability").ifPresent(power -> createSafeExplosion(
+            player, player.getLocation(), power));
     itemService.intValue(attributes, "time_slow_ability").ifPresent(seconds -> applySlowNearby(
-        player, seconds));
+            player, seconds));
     String summon = attributes.get("summon_entity");
     if (summon != null && !summon.isBlank()) {
       spawnEntityNearPlayer(player, summon);
@@ -673,9 +705,9 @@ public final class CustomItemListener implements Listener {
   }
 
   private void applyCombatAttributes(
-      Player attacker,
-      EntityDamageByEntityEvent event,
-      Map<String, String> attributes) {
+          Player attacker,
+          EntityDamageByEntityEvent event,
+          Map<String, String> attributes) {
     double damage = event.getDamage();
     double attackDamageBonus = itemService.doubleValue(attributes, "attack_damage").orElse(0.0);
     if (!(event.getDamager() instanceof Player)) {
@@ -692,54 +724,49 @@ public final class CustomItemListener implements Listener {
     }
     if (rollCritical(attributes) || isVanillaCritical(attacker)) {
       double critMulti = itemService.doubleValue(attributes, "critical_damage_multiplier")
-          .orElse(1.5);
+              .orElse(1.5);
       damage *= critMulti;
       attacker.getWorld().spawnParticle(Particle.CRIT, event.getEntity().getLocation().add(0, 1, 0),
-          16, 0.2, 0.3, 0.2, 0.0);
+              16, 0.2, 0.3, 0.2, 0.0);
     }
     event.setDamage(damage);
     double finalDamage = damage;
     if (event.getEntity() instanceof LivingEntity target) {
       itemService.doubleValue(attributes, "knockback_strength")
-          .ifPresent(strength -> {
-            Vector direction = target.getLocation().toVector().subtract(attacker.getLocation()
-                    .toVector())
-                .normalize();
-            target.setVelocity(target.getVelocity().add(direction.multiply(strength)));
-          });
+              .ifPresent(strength -> {
+                Vector direction = target.getLocation().toVector().subtract(attacker.getLocation()
+                                .toVector())
+                        .normalize();
+                target.setVelocity(target.getVelocity().add(direction.multiply(strength)));
+              });
       itemService.doubleValue(attributes, "life_steal").ifPresent(amount -> {
         org.bukkit.attribute.AttributeInstance maxHealth = attacker.getAttribute(
-            org.bukkit.attribute.Attribute.MAX_HEALTH);
+                org.bukkit.attribute.Attribute.MAX_HEALTH);
         double cap = maxHealth == null ? 20.0 : maxHealth.getValue();
         attacker.setHealth(Math.min(cap, attacker.getHealth() + finalDamage * amount));
       });
       itemService.intValue(attributes, "burn_target").ifPresent(seconds -> target.setFireTicks(
-          seconds * 20));
-      itemService.intValue(attributes, "freeze_target").ifPresent(seconds -> {
-        int freezeTicks = Math.max(target.getFreezeTicks(), seconds * 140);
-        target.setFreezeTicks(freezeTicks);
-        target.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, seconds * 20, 1, true,
-            true, true));
-      });
+              seconds * 20));
+      itemService.intValue(attributes, "freeze_target").ifPresent(seconds -> applyFreezeTarget(target,
+              seconds));
       itemService.intValue(attributes, "poison_target")
-          .ifPresent(seconds -> target.addPotionEffect(new PotionEffect(PotionEffectType.POISON,
-              seconds * 20, 0, true, true, true)));
+              .ifPresent(seconds -> target.addPotionEffect(new PotionEffect(PotionEffectType.POISON,
+                      seconds * 20, 0, true, true, true)));
       if (itemService.boolValue(attributes, "shield_breaker") && target instanceof Player player) {
         player.setCooldown(Material.SHIELD, 80);
       }
       itemService.doubleValue(attributes, "sweeping_radius")
-          .ifPresent(radius -> sweepDamage(attacker, target, finalDamage * 0.5, radius));
+              .ifPresent(radius -> sweepDamage(attacker, target, finalDamage * 0.5, radius));
       itemService.doubleValue(attributes, "multi_target_strike")
-          .ifPresent(radius -> sweepDamage(attacker, target, finalDamage * 0.75, radius));
+              .ifPresent(radius -> sweepDamage(attacker, target, finalDamage * 0.75, radius));
       itemService.intValue(attributes, "chain_lightning")
-          .ifPresent(hops -> chainLightning(attacker, target, hops, finalDamage * 0.4));
-      itemService.doubleValue(attributes, "explosive_hit")
-          .ifPresent(power -> target.getWorld().createExplosion(target.getLocation(),
-              power.floatValue(), false, false, attacker));
+              .ifPresent(hops -> chainLightning(attacker, target, hops, finalDamage * 0.4));
+      itemService.doubleValue(attributes, "explosive_hit").ifPresent(power -> createSafeExplosion(
+              attacker, target.getLocation(), power));
       itemService.doubleValue(attributes, "pull_effect")
-          .ifPresent(radius -> pullNearbyEntities(attacker, radius, 0.4));
+              .ifPresent(radius -> pullNearbyEntities(attacker, radius, 0.4));
       itemService.doubleValue(attributes, "push_effect")
-          .ifPresent(radius -> pushNearbyEntities(attacker, radius, 0.8));
+              .ifPresent(radius -> pushNearbyEntities(attacker, radius, 0.8));
     }
     int hits = comboHits.getOrDefault(attacker.getUniqueId(), 0) + 1;
     comboHits.put(attacker.getUniqueId(), hits);
@@ -755,27 +782,27 @@ public final class CustomItemListener implements Listener {
     UUID playerId = player.getUniqueId();
     long now = System.currentTimeMillis();
     boolean shouldRefresh = now - potionRefreshTimes.getOrDefault(playerId, 0L)
-        >= POTION_REFRESH_INTERVAL_MS;
+            >= POTION_REFRESH_INTERVAL_MS;
     if (shouldRefresh) {
       potionRefreshTimes.put(playerId, now);
     }
     Set<PotionEffectType> desiredEffects = new HashSet<>();
     applyOptionalEffect(player, attributes, "speed_bonus", PotionEffectType.SPEED, desiredEffects,
-        shouldRefresh);
+            shouldRefresh);
     applyOptionalEffect(player, attributes, "jump_boost", PotionEffectType.JUMP_BOOST, desiredEffects,
-        shouldRefresh);
+            shouldRefresh);
     applyOptionalEffect(player, attributes, "haste", PotionEffectType.HASTE, desiredEffects,
-        shouldRefresh);
+            shouldRefresh);
     applyOptionalEffect(player, attributes, "strength_boost", PotionEffectType.STRENGTH, desiredEffects,
-        shouldRefresh);
+            shouldRefresh);
     applyOptionalEffect(player, attributes, "regeneration", PotionEffectType.REGENERATION, desiredEffects,
-        shouldRefresh);
+            shouldRefresh);
     if (itemService.boolValue(attributes, "night_vision")) {
       applyManagedPotionEffect(player, PotionEffectType.NIGHT_VISION, 0, desiredEffects, shouldRefresh);
     }
     if (itemService.boolValue(attributes, "water_breathing")) {
       applyManagedPotionEffect(player, PotionEffectType.WATER_BREATHING, 0, desiredEffects,
-          shouldRefresh);
+              shouldRefresh);
     }
     if (itemService.boolValue(attributes, "fire_resistance")) {
       applyManagedPotionEffect(player, PotionEffectType.FIRE_RESISTANCE, 0, desiredEffects, shouldRefresh);
@@ -783,12 +810,12 @@ public final class CustomItemListener implements Listener {
     itemService.doubleValue(attributes, "health_bonus").ifPresent(healthBonus -> {
       int amplifier = Math.max(0, (int) Math.floor(healthBonus / 4.0));
       applyManagedPotionEffect(player, PotionEffectType.HEALTH_BOOST, amplifier, desiredEffects,
-          shouldRefresh);
+              shouldRefresh);
     });
     itemService.doubleValue(attributes, "absorption_hearts").ifPresent(extra -> {
       int amplifier = Math.max(0, (int) Math.floor(extra / 4.0));
       applyManagedPotionEffect(player, PotionEffectType.ABSORPTION, amplifier, desiredEffects,
-          shouldRefresh);
+              shouldRefresh);
     });
     removeStaleManagedPotionEffects(player, desiredEffects);
   }
@@ -912,9 +939,9 @@ public final class CustomItemListener implements Listener {
   }
 
   private void mergeMaxIntegerAttribute(
-      Map<String, String> merged,
-      Map<String, String> candidate,
-      String key) {
+          Map<String, String> merged,
+          Map<String, String> candidate,
+          String key) {
     itemService.intValue(candidate, key).ifPresent(value -> {
       int current = itemService.intValue(merged, key).orElse(0);
       if (value > current) {
@@ -924,9 +951,9 @@ public final class CustomItemListener implements Listener {
   }
 
   private void mergeMaxDoubleAttribute(
-      Map<String, String> merged,
-      Map<String, String> candidate,
-      String key) {
+          Map<String, String> merged,
+          Map<String, String> candidate,
+          String key) {
     itemService.doubleValue(candidate, key).ifPresent(value -> {
       double current = itemService.doubleValue(merged, key).orElse(0.0);
       if (value > current) {
@@ -936,9 +963,9 @@ public final class CustomItemListener implements Listener {
   }
 
   private void mergeBooleanAttribute(
-      Map<String, String> merged,
-      Map<String, String> candidate,
-      String key) {
+          Map<String, String> merged,
+          Map<String, String> candidate,
+          String key) {
     if (itemService.boolValue(candidate, key)) {
       merged.put(key, "true");
     }
@@ -962,11 +989,11 @@ public final class CustomItemListener implements Listener {
   }
 
   private void applyManagedPotionEffect(
-      Player player,
-      PotionEffectType effectType,
-      int amplifier,
-      Set<PotionEffectType> desiredEffects,
-      boolean shouldRefresh) {
+          Player player,
+          PotionEffectType effectType,
+          int amplifier,
+          Set<PotionEffectType> desiredEffects,
+          boolean shouldRefresh) {
     desiredEffects.add(effectType);
     PotionEffect active = player.getPotionEffect(effectType);
     boolean missing = active == null;
@@ -975,7 +1002,7 @@ public final class CustomItemListener implements Listener {
       return;
     }
     player.addPotionEffect(new PotionEffect(effectType, POTION_DURATION_TICKS, amplifier, true, false,
-        false));
+            false));
   }
 
   private void applyTrailParticles(Player player, Map<String, String> attributes) {
@@ -984,7 +1011,7 @@ public final class CustomItemListener implements Listener {
       return;
     }
     spawnConfiguredParticle(player, particleName, player.getLocation().add(0, 0.15, 0), 10, 0.25,
-        0.1, 0.25, 0.01);
+            0.1, 0.25, 0.01);
   }
 
   private void applyBlockHighlighting(Player player, Map<String, String> attributes) {
@@ -1002,7 +1029,7 @@ public final class CustomItemListener implements Listener {
             Location center = block.getLocation().add(0.5, 0.5, 0.5);
             player.spawnParticle(Particle.END_ROD, center, 8, 0.25, 0.25, 0.25, 0.0);
             player.spawnParticle(Particle.ELECTRIC_SPARK, center.clone().add(0, 0.3, 0), 12, 0.35,
-                0.25, 0.35, 0.02);
+                    0.25, 0.35, 0.02);
             highlighted++;
           }
         }
@@ -1018,23 +1045,23 @@ public final class CustomItemListener implements Listener {
     for (Entity entity : player.getNearbyEntities(radius, radius, radius)) {
       if (entity instanceof LivingEntity living && !(living instanceof Player)) {
         living.addPotionEffect(new PotionEffect(PotionEffectType.GLOWING, 40, 0, true, false,
-            false));
+                false));
       }
     }
   }
 
   private void applyMagnetModes(Player player, Map<String, String> attributes) {
     boolean vacuumTuned = attributes.containsKey("item_vacuum_radius")
-        || attributes.containsKey("item_vacuum_pull_radius");
+            || attributes.containsKey("item_vacuum_pull_radius");
     boolean magnetMode = itemService.boolValue(attributes, "magnet_mode") || vacuumTuned;
     boolean autoPickup = itemService.boolValue(attributes, "auto_pickup");
     boolean xpMagnet = itemService.boolValue(attributes, "xp_magnet");
     double radius = itemService.doubleValue(attributes, "item_vacuum_radius")
-        .orElse(plugin.getConfig().getDouble("default-item-vacuum-radius", 6.0));
+            .orElse(plugin.getConfig().getDouble("default-item-vacuum-radius", 6.0));
     double configuredPull = itemService.doubleValue(attributes, "item_vacuum_pull_radius")
-        .orElse(plugin.getConfig().getDouble("default-item-vacuum-pull-radius", 0.28));
+            .orElse(plugin.getConfig().getDouble("default-item-vacuum-pull-radius", 0.28));
     if (!attributes.containsKey("item_vacuum_radius") && attributes.containsKey("item_vacuum_pull_radius")
-        && configuredPull > radius) {
+            && configuredPull > radius) {
       radius = configuredPull;
     }
     double pullStrength = Math.max(0.02, Math.min(2.0, configuredPull));
@@ -1056,7 +1083,7 @@ public final class CustomItemListener implements Listener {
       }
       if (xpMagnet && entity instanceof ExperienceOrb orb) {
         Vector velocity = player.getLocation().toVector().subtract(orb.getLocation().toVector())
-            .normalize().multiply(pullStrength + 0.04);
+                .normalize().multiply(pullStrength + 0.04);
         orb.setVelocity(velocity);
       }
     }
@@ -1082,9 +1109,9 @@ public final class CustomItemListener implements Listener {
     }
     ItemStack original = item.getItemStack();
     int remainingAmount = overflow.values()
-        .stream()
-        .mapToInt(ItemStack::getAmount)
-        .sum();
+            .stream()
+            .mapToInt(ItemStack::getAmount)
+            .sum();
     int clampedAmount = Math.max(1, Math.min(original.getAmount(), remainingAmount));
     ItemStack remaining = original.clone();
     remaining.setAmount(clampedAmount);
@@ -1093,7 +1120,7 @@ public final class CustomItemListener implements Listener {
 
   private void updateDoubleJumpState(Player player, Map<String, String> attributes) {
     if (player.getGameMode().name().equals("CREATIVE")
-        || player.getGameMode().name().equals("SPECTATOR")) {
+            || player.getGameMode().name().equals("SPECTATOR")) {
       return;
     }
     boolean hasDoubleJump = itemService.intValue(attributes, "double_jump").orElse(0) > 0;
@@ -1120,12 +1147,12 @@ public final class CustomItemListener implements Listener {
       for (int z = -radius; z <= radius; z++) {
         Block current = clicked.getRelative(x, 0, z);
         if (current.getType() == Material.DIRT || current.getType() == Material.GRASS_BLOCK
-            || current.getType() == Material.DIRT_PATH) {
+                || current.getType() == Material.DIRT_PATH) {
           Block above = current.getRelative(BlockFace.UP);
           if (above.getType() == Material.AIR) {
             current.setType(Material.FARMLAND);
             player.getWorld().spawnParticle(Particle.BLOCK, current.getLocation().add(0.5, 0.5, 0.5),
-                4, 0.2, 0.2, 0.2, Material.FARMLAND.createBlockData());
+                    4, 0.2, 0.2, 0.2, Material.FARMLAND.createBlockData());
           }
         }
       }
@@ -1133,11 +1160,11 @@ public final class CustomItemListener implements Listener {
   }
 
   private void applyPlacementRadius(
-      Player player,
-      Block clicked,
-      BlockFace clickedFace,
-      ItemStack held,
-      Map<String, String> attributes) {
+          Player player,
+          Block clicked,
+          BlockFace clickedFace,
+          ItemStack held,
+          Map<String, String> attributes) {
     String placement = attributes.get("block_placement_radius");
     if (placement == null || placement.isBlank()) {
       return;
@@ -1153,8 +1180,8 @@ public final class CustomItemListener implements Listener {
     Block origin = clicked.getRelative(face);
     if (mode.equals("line")) {
       BlockFace direction = face == BlockFace.UP || face == BlockFace.DOWN
-          ? horizontalFacing(player.getFacing())
-          : face;
+              ? horizontalFacing(player.getFacing())
+              : face;
       for (int i = 0; i < value; i++) {
         Block target = origin.getRelative(direction, i);
         if (target.getType() == Material.AIR) {
@@ -1167,8 +1194,8 @@ public final class CustomItemListener implements Listener {
       for (int y = 0; y < value; y++) {
         for (int offset = -width; offset <= width; offset++) {
           Block target = facing == BlockFace.NORTH || facing == BlockFace.SOUTH
-              ? origin.getRelative(offset, y, 0)
-              : origin.getRelative(0, y, offset);
+                  ? origin.getRelative(offset, y, 0)
+                  : origin.getRelative(0, y, offset);
           if (target.getType() == Material.AIR) {
             target.setType(placeMaterial);
           }
@@ -1202,7 +1229,7 @@ public final class CustomItemListener implements Listener {
       return;
     }
     int radius = Math.max(1, itemService.intValue(attributes, "break_radius")
-        .orElse(plugin.getConfig().getInt("default-break-radius", 1)));
+            .orElse(plugin.getConfig().getInt("default-break-radius", 1)));
     Location center = clicked.getLocation();
     for (int x = -radius; x <= radius; x++) {
       for (int y = -radius; y <= radius; y++) {
@@ -1250,12 +1277,12 @@ public final class CustomItemListener implements Listener {
   }
 
   private Set<Block> collectVolume(
-      Block origin,
-      Player player,
-      Map<String, String> attributes,
-      int width,
-      int height,
-      int depth) {
+          Block origin,
+          Player player,
+          Map<String, String> attributes,
+          int width,
+          int height,
+          int depth) {
     Set<Block> blocks = new HashSet<>();
     int halfWidth = Math.max(0, width / 2);
     int halfDepth = Math.max(0, depth / 2);
@@ -1292,8 +1319,8 @@ public final class CustomItemListener implements Listener {
           for (int z = -1; z <= 1; z++) {
             Block relative = current.getRelative(x, y, z);
             if (isMatchingOreFamily(relative.getType(), family)
-                && !isUnbreakableBlock(relative.getType())
-                && !found.contains(relative)) {
+                    && !isUnbreakableBlock(relative.getType())
+                    && !found.contains(relative)) {
               queue.add(relative);
             }
           }
@@ -1330,8 +1357,8 @@ public final class CustomItemListener implements Listener {
             Block relative = current.getRelative(x, y, z);
             String type = relative.getType().name();
             if ((type.endsWith("_LOG") || type.endsWith("_LEAVES"))
-                && !isUnbreakableBlock(relative.getType())
-                && !found.contains(relative)) {
+                    && !isUnbreakableBlock(relative.getType())
+                    && !found.contains(relative)) {
               queue.add(relative);
             }
           }
@@ -1384,18 +1411,18 @@ public final class CustomItemListener implements Listener {
       return new int[] {3, 3, 3};
     }
     return new int[] {
-        Math.max(1, safeParseInt(split[0], 3)),
-        Math.max(1, safeParseInt(split[1], 3)),
-        Math.max(1, safeParseInt(split[2], 3))
+            Math.max(1, safeParseInt(split[0], 3)),
+            Math.max(1, safeParseInt(split[1], 3)),
+            Math.max(1, safeParseInt(split[2], 3))
     };
   }
 
   private void teleportForward(Player player, double distance) {
     RayTraceResult ray = player.getWorld().rayTraceBlocks(player.getEyeLocation(),
-        player.getLocation().getDirection(), distance);
+            player.getLocation().getDirection(), distance);
     Location target = ray != null && ray.getHitPosition() != null
-        ? ray.getHitPosition().toLocation(player.getWorld())
-        : player.getEyeLocation().add(player.getLocation().getDirection().multiply(distance));
+            ? ray.getHitPosition().toLocation(player.getWorld())
+            : player.getEyeLocation().add(player.getLocation().getDirection().multiply(distance));
     target.setPitch(player.getLocation().getPitch());
     target.setYaw(player.getLocation().getYaw());
     player.teleport(target);
@@ -1411,7 +1438,7 @@ public final class CustomItemListener implements Listener {
       living.damage(4.0, player);
       combatEffectGuard.remove(player.getUniqueId());
       living.getWorld().spawnParticle(Particle.SWEEP_ATTACK, living.getLocation().add(0, 1, 0), 1,
-          0.0, 0.0, 0.0, 0.0);
+              0.0, 0.0, 0.0, 0.0);
     }
   }
 
@@ -1420,15 +1447,49 @@ public final class CustomItemListener implements Listener {
     dash.setY(Math.max(dash.getY(), 0.25));
     player.setVelocity(dash);
     player.getWorld().spawnParticle(Particle.CLOUD, player.getLocation().add(0, 0.2, 0), 18, 0.2,
-        0.1, 0.2, 0.01);
+            0.1, 0.2, 0.01);
   }
 
   private void applySlowNearby(Player player, int seconds) {
     for (Entity entity : player.getNearbyEntities(6.0, 4.0, 6.0)) {
       if (entity instanceof LivingEntity living && !entity.equals(player)) {
         living.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, seconds * 20, 1, true,
-            true, true));
+                true, true));
       }
+    }
+  }
+
+  private void applyFreezeTarget(LivingEntity target, int seconds) {
+    if (seconds <= 0) {
+      return;
+    }
+    int clampedSeconds = Math.min(seconds, maxFreezeSeconds);
+    int durationTicks = clampedSeconds * 20;
+    int desiredFreezeTicks = Math.max(durationTicks, target.getMaxFreezeTicks());
+    target.setFreezeTicks(Math.max(target.getFreezeTicks(), desiredFreezeTicks));
+    target.setVelocity(target.getVelocity().multiply(0.1));
+    target.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, durationTicks, 5, true, true,
+            true));
+  }
+
+  private void createSafeExplosion(Player source, Location location, double rawPower) {
+    if (!Double.isFinite(rawPower) || rawPower < minExplosionPower) {
+      return;
+    }
+    World world = location.getWorld();
+    if (world == null || !world.equals(source.getWorld())) {
+      return;
+    }
+    float power = (float) Math.min(rawPower, maxExplosionPower);
+    combatEffectGuard.add(source.getUniqueId());
+    try {
+      world.createExplosion(location, power, false, false, source);
+    } catch (Throwable throwable) {
+      plugin.getLogger().warning("Explosion ability failed at "
+              + location.getBlockX() + "," + location.getBlockY() + "," + location.getBlockZ()
+              + " in world '" + world.getName() + "'.");
+    } finally {
+      combatEffectGuard.remove(source.getUniqueId());
     }
   }
 
@@ -1442,16 +1503,16 @@ public final class CustomItemListener implements Listener {
   }
 
   private void triggerNamedAbility(
-      Player player,
-      ItemStack held,
-      String abilityName,
-      Map<String, String> attributes) {
+          Player player,
+          ItemStack held,
+          String abilityName,
+          Map<String, String> attributes) {
     String normalized = abilityName.toLowerCase(Locale.ROOT);
     if (normalized.equals("heal")) {
       player.setHealth(Math.min(player.getAttribute(org.bukkit.attribute.Attribute.MAX_HEALTH)
-          .getValue(), player.getHealth() + 6.0));
+              .getValue(), player.getHealth() + 6.0));
       player.getWorld().spawnParticle(Particle.HEART, player.getLocation().add(0, 1, 0), 6, 0.4,
-          0.3, 0.4, 0.01);
+              0.3, 0.4, 0.01);
     } else if (normalized.equals("blink")) {
       double distance = itemService.doubleValue(attributes, "teleport_on_right_click").orElse(6.0);
       teleportForward(player, distance);
@@ -1463,7 +1524,7 @@ public final class CustomItemListener implements Listener {
     } else if (normalized.equals("block")) {
       int seconds = itemService.intValue(attributes, "block_ability").orElse(4);
       player.addPotionEffect(new PotionEffect(PotionEffectType.RESISTANCE, seconds * 20, 2, true,
-          true, true));
+              true, true));
     }
   }
 
@@ -1491,7 +1552,7 @@ public final class CustomItemListener implements Listener {
     for (Entity entity : player.getNearbyEntities(radius, radius, radius)) {
       if (entity instanceof LivingEntity living && !living.equals(player)) {
         Vector pull = player.getLocation().toVector().subtract(entity.getLocation().toVector())
-            .normalize().multiply(strength);
+                .normalize().multiply(strength);
         entity.setVelocity(entity.getVelocity().add(pull));
       }
     }
@@ -1501,7 +1562,7 @@ public final class CustomItemListener implements Listener {
     for (Entity entity : player.getNearbyEntities(radius, radius, radius)) {
       if (entity instanceof LivingEntity living && !living.equals(player)) {
         Vector push = entity.getLocation().toVector().subtract(player.getLocation().toVector())
-            .normalize().multiply(strength);
+                .normalize().multiply(strength);
         entity.setVelocity(entity.getVelocity().add(push));
       }
     }
@@ -1528,13 +1589,13 @@ public final class CustomItemListener implements Listener {
     for (int i = 0; i < hops; i++) {
       Location currentLocation = current.getLocation();
       Optional<LivingEntity> next = current.getNearbyEntities(6.0, 6.0, 6.0)
-          .stream()
-          .filter(entity -> entity instanceof LivingEntity)
-          .map(entity -> (LivingEntity) entity)
-          .filter(entity -> !entity.equals(attacker))
-          .filter(entity -> !chain.contains(entity))
-          .min(Comparator.comparingDouble(entity -> entity.getLocation().distanceSquared(
-              currentLocation)));
+              .stream()
+              .filter(entity -> entity instanceof LivingEntity)
+              .map(entity -> (LivingEntity) entity)
+              .filter(entity -> !entity.equals(attacker))
+              .filter(entity -> !chain.contains(entity))
+              .min(Comparator.comparingDouble(entity -> entity.getLocation().distanceSquared(
+                      currentLocation)));
       if (next.isEmpty()) {
         break;
       }
@@ -1544,7 +1605,7 @@ public final class CustomItemListener implements Listener {
       victim.damage(hopDamage, attacker);
       combatEffectGuard.remove(attacker.getUniqueId());
       victim.getWorld().spawnParticle(Particle.ELECTRIC_SPARK, victim.getLocation().add(0, 1, 0),
-          10, 0.2, 0.3, 0.2, 0.03);
+              10, 0.2, 0.3, 0.2, 0.03);
       current = victim;
     }
   }
@@ -1561,15 +1622,15 @@ public final class CustomItemListener implements Listener {
   }
 
   private void applyOptionalEffect(
-      Player player,
-      Map<String, String> attributes,
-      String attribute,
-      PotionEffectType effectType,
-      Set<PotionEffectType> desiredEffects,
-      boolean shouldRefresh) {
+          Player player,
+          Map<String, String> attributes,
+          String attribute,
+          PotionEffectType effectType,
+          Set<PotionEffectType> desiredEffects,
+          boolean shouldRefresh) {
     itemService.intValue(attributes, attribute)
-        .ifPresent(level -> applyManagedPotionEffect(player, effectType, Math.max(0, level - 1),
-            desiredEffects, shouldRefresh));
+            .ifPresent(level -> applyManagedPotionEffect(player, effectType, Math.max(0, level - 1),
+                    desiredEffects, shouldRefresh));
   }
 
   private void playUseSound(Player player, Map<String, String> attributes) {
@@ -1578,7 +1639,7 @@ public final class CustomItemListener implements Listener {
       return;
     }
     optionalSound(soundName).ifPresent(sound -> player.getWorld().playSound(player.getLocation(),
-        sound, 0.8f, 1.0f));
+            sound, 0.8f, 1.0f));
   }
 
   private void playHitSound(Player player, Map<String, String> attributes) {
@@ -1587,7 +1648,7 @@ public final class CustomItemListener implements Listener {
       return;
     }
     optionalSound(soundName).ifPresent(sound -> player.getWorld().playSound(player.getLocation(),
-        sound, 1.0f, 1.0f));
+            sound, 1.0f, 1.0f));
   }
 
   private void playSwingParticles(Player player, Map<String, String> attributes) {
@@ -1596,25 +1657,25 @@ public final class CustomItemListener implements Listener {
       return;
     }
     spawnConfiguredParticle(
-        player,
-        particleName,
-        player.getEyeLocation().add(player.getLocation().getDirection().multiply(1.1)),
-        10,
-        0.18,
-        0.18,
-        0.18,
-        0.03);
+            player,
+            particleName,
+            player.getEyeLocation().add(player.getLocation().getDirection().multiply(1.1)),
+            10,
+            0.18,
+            0.18,
+            0.18,
+            0.03);
   }
 
   private void spawnConfiguredParticle(
-      Player player,
-      String configuredValue,
-      Location location,
-      int count,
-      double offsetX,
-      double offsetY,
-      double offsetZ,
-      double extra) {
+          Player player,
+          String configuredValue,
+          Location location,
+          int count,
+          double offsetX,
+          double offsetY,
+          double offsetZ,
+          double extra) {
     Optional<ConfiguredParticle> configured = parseConfiguredParticle(configuredValue);
     if (configured.isEmpty()) {
       return;
@@ -1622,24 +1683,24 @@ public final class CustomItemListener implements Listener {
     ConfiguredParticle particle = configured.get();
     if (particle.data() == null) {
       player.getWorld().spawnParticle(
-          particle.particle(),
-          location,
-          count,
-          offsetX,
-          offsetY,
-          offsetZ,
-          extra);
+              particle.particle(),
+              location,
+              count,
+              offsetX,
+              offsetY,
+              offsetZ,
+              extra);
       return;
     }
     player.getWorld().spawnParticle(
-        particle.particle(),
-        location,
-        count,
-        offsetX,
-        offsetY,
-        offsetZ,
-        extra,
-        particle.data());
+            particle.particle(),
+            location,
+            count,
+            offsetX,
+            offsetY,
+            offsetZ,
+            extra,
+            particle.data());
   }
 
   private void animateLoreIfNeeded(ItemStack held, Map<String, String> attributes) {
@@ -1672,10 +1733,10 @@ public final class CustomItemListener implements Listener {
 
   private boolean isVanillaCritical(Player player) {
     return player.getFallDistance() > 0.0f
-        && !player.isOnGround()
-        && !player.isSprinting()
-        && !player.isInsideVehicle()
-        && !player.hasPotionEffect(PotionEffectType.BLINDNESS);
+            && !player.isOnGround()
+            && !player.isSprinting()
+            && !player.isInsideVehicle()
+            && !player.hasPotionEffect(PotionEffectType.BLINDNESS);
   }
 
   private boolean passesBlockLists(Block block, Map<String, String> attributes) {
@@ -1706,19 +1767,19 @@ public final class CustomItemListener implements Listener {
     }
     return switch (material) {
       case BEDROCK,
-          BARRIER,
-          END_PORTAL_FRAME,
-          END_PORTAL,
-          NETHER_PORTAL,
-          END_GATEWAY,
-          COMMAND_BLOCK,
-          CHAIN_COMMAND_BLOCK,
-          REPEATING_COMMAND_BLOCK,
-          STRUCTURE_BLOCK,
-          JIGSAW,
-          LIGHT,
-          RESPAWN_ANCHOR ->
-          true;
+           BARRIER,
+           END_PORTAL_FRAME,
+           END_PORTAL,
+           NETHER_PORTAL,
+           END_GATEWAY,
+           COMMAND_BLOCK,
+           CHAIN_COMMAND_BLOCK,
+           REPEATING_COMMAND_BLOCK,
+           STRUCTURE_BLOCK,
+           JIGSAW,
+           LIGHT,
+           RESPAWN_ANCHOR ->
+              true;
       default -> false;
     };
   }
@@ -1787,8 +1848,8 @@ public final class CustomItemListener implements Listener {
 
   private boolean isPluginManagedItem(ItemStack stack) {
     return stack != null
-        && stack.getType() != Material.AIR
-        && itemService.customItemId(stack).isPresent();
+            && stack.getType() != Material.AIR
+            && itemService.customItemId(stack).isPresent();
   }
 
   private boolean inventoryHasPluginItem(Inventory inventory, int... slots) {
@@ -1804,9 +1865,9 @@ public final class CustomItemListener implements Listener {
     Inventory topInventory = event.getView().getTopInventory();
     InventoryType type = topInventory.getType();
     if (type != InventoryType.ANVIL
-        && type != InventoryType.GRINDSTONE
-        && type != InventoryType.ENCHANTING
-        && type != InventoryType.SMITHING) {
+            && type != InventoryType.GRINDSTONE
+            && type != InventoryType.ENCHANTING
+            && type != InventoryType.SMITHING) {
       return false;
     }
     if (event.isShiftClick() && isPluginManagedItem(event.getCurrentItem())) {
@@ -1874,7 +1935,7 @@ public final class CustomItemListener implements Listener {
     }
     Map<String, String> attributes = itemService.resolveAttributes(stack);
     return itemService.boolValue(attributes, "infinite")
-        || isPreventedByDefault(attributes, "prevent_bundle");
+            || isPreventedByDefault(attributes, "prevent_bundle");
   }
 
   private boolean isAirOrNull(ItemStack stack) {
@@ -1919,9 +1980,9 @@ public final class CustomItemListener implements Listener {
 
   private boolean isValuable(Material material) {
     return material.name().endsWith("_ORE")
-        || material == Material.ANCIENT_DEBRIS
-        || material == Material.CHEST
-        || material == Material.SPAWNER;
+            || material == Material.ANCIENT_DEBRIS
+            || material == Material.CHEST
+            || material == Material.SPAWNER;
   }
 
   private Optional<ConfiguredParticle> parseConfiguredParticle(String value) {
@@ -1933,8 +1994,8 @@ public final class CustomItemListener implements Listener {
       return Optional.of(new ConfiguredParticle(Particle.valueOf(normalized), null));
     } catch (IllegalArgumentException ex) {
       String materialName = normalized.startsWith("BLOCK:")
-          ? normalized.substring("BLOCK:".length())
-          : normalized;
+              ? normalized.substring("BLOCK:".length())
+              : normalized;
       Material material = safeMaterial(materialName);
       if (material != null && material.isBlock()) {
         return Optional.of(new ConfiguredParticle(Particle.BLOCK, material.createBlockData()));
@@ -1990,11 +2051,21 @@ public final class CustomItemListener implements Listener {
 
   private String locationKey(Location location) {
     return location.getWorld().getName() + ':' + location.getBlockX() + ':' + location.getBlockY()
-        + ':' + location.getBlockZ();
+            + ':' + location.getBlockZ();
   }
 
   private String color(String message) {
     return ChatColor.translateAlternateColorCodes('&', message);
+  }
+
+  private boolean isDropConfirmationEnabled() {
+    return plugin.getConfig().getBoolean("drop-confirmation.enabled", false);
+  }
+
+  private int configuredDropConfirmWindowSeconds() {
+    return Math.max(1,
+        plugin.getConfig().getInt("drop-confirmation.window-seconds",
+            defaultDropConfirmWindowSeconds));
   }
 
   private boolean isPreventedByDefault(Map<String, String> attributes, String key) {
@@ -2004,8 +2075,16 @@ public final class CustomItemListener implements Listener {
     return itemService.boolValue(attributes, key);
   }
 
+  private record PendingDropConfirmation(
+      String customItemId,
+      long expiresAtMs) {
+    private boolean matches(String currentCustomItemId, long nowMs) {
+      return customItemId.equals(currentCustomItemId) && nowMs <= expiresAtMs;
+    }
+  }
+
   private record ConfiguredParticle(
-      Particle particle,
-      Object data) {
+          Particle particle,
+          Object data) {
   }
 }
