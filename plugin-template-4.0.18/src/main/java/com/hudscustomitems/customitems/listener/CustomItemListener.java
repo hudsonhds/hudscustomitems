@@ -154,6 +154,9 @@ public final class CustomItemListener implements Listener {
       return;
     }
     Map<String, String> attributes = itemService.resolveAttributes(held);
+    if (breakGuard.contains(locationKey(event.getBlock().getLocation()))) {
+      return;
+    }
     if (!itemService.canUse(player, held, null, true)) {
       event.setCancelled(true);
       return;
@@ -188,10 +191,6 @@ public final class CustomItemListener implements Listener {
     boolean replantMain = itemService.boolValue(attributes, "auto_replant")
             && isHarvestableCrop(event.getBlock());
     Material mainCropType = event.getBlock().getType();
-    String locationKey = locationKey(event.getBlock().getLocation());
-    if (breakGuard.contains(locationKey)) {
-      return;
-    }
     if (itemService.boolValue(attributes, "no_block_drops")) {
       event.setDropItems(false);
     }
@@ -218,9 +217,13 @@ public final class CustomItemListener implements Listener {
         Material cropType = block.getType();
         String key = locationKey(block.getLocation());
         breakGuard.add(key);
-        breakExtraBlock(block, player, held, attributes);
-        breakGuard.remove(key);
-        if (replantExtra) {
+        boolean broken;
+        try {
+          broken = breakExtraBlock(block, player, held, attributes);
+        } finally {
+          breakGuard.remove(key);
+        }
+        if (replantExtra && broken) {
           scheduleCropReplant(block, cropType);
         }
       }
@@ -231,15 +234,25 @@ public final class CustomItemListener implements Listener {
     itemService.consumeUse(player, held);
   }
 
-  private void breakExtraBlock(
+  private boolean breakExtraBlock(
           Block block,
           Player player,
           ItemStack held,
           Map<String, String> attributes) {
-    List<ItemStack> drops = new ArrayList<>(block.getDrops(held, player));
+    if (block.getType() == Material.AIR) {
+      return false;
+    }
+    BlockBreakEvent syntheticBreak = new BlockBreakEvent(block, player);
+    Bukkit.getPluginManager().callEvent(syntheticBreak);
+    if (syntheticBreak.isCancelled()) {
+      return false;
+    }
+    List<ItemStack> drops = syntheticBreak.isDropItems()
+            ? new ArrayList<>(block.getDrops(held, player))
+            : List.of();
     block.setType(Material.AIR, false);
-    if (itemService.boolValue(attributes, "no_block_drops")) {
-      return;
+    if (itemService.boolValue(attributes, "no_block_drops") || !syntheticBreak.isDropItems()) {
+      return true;
     }
     boolean autoSmelt = itemService.boolValue(attributes, "auto_smelt");
     double multiplier = itemService.doubleValue(attributes, "block_drop_multiplier").orElse(1.0);
@@ -257,6 +270,7 @@ public final class CustomItemListener implements Listener {
         }
       }
     }
+    return true;
   }
 
   @EventHandler(priority = EventPriority.HIGHEST, ignoreCancelled = true)

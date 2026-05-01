@@ -1,9 +1,9 @@
 main: com.hudscustomitems.customitems.CustomItemsPlugin
 name: ${NAME}
 version: "${VERSION}"
-api-version: "1.21"
+api-version: "26.1"
 author: HUDS
-description: Command-first custom items for Paper 1.21 through 1.21.11
+description: Command-first custom items for Paper 1.26.1 through 1.26.1.2
 softdepend: [ProtocolLib]
 commands:
   customitems:

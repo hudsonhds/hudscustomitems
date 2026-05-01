@@ -44,7 +44,7 @@ Here's a list of the PaperMC versions and the versions of this latest compatible
 
 | PaperMC | ExamplePlugin |
 |---------|---------------|
-| 1.21.11 | 4.0.18+       |
+| 1.26.1  | 4.0.18+       |
 | 1.21.10 | 4.0.17        |
 | 1.21.8  | 4.0.16        |
 | 1.21.7  | 4.0.15        |
@@ -135,12 +135,12 @@ Also, update your dependencies as needed (of course).
 
 ```groovy
 dependencies {
-    compileOnly 'io.papermc.paper:paper-api:1.21.6-R0.1-SNAPSHOT'
+    compileOnly 'io.papermc.paper:paper-api:1.26.1-R0.1-SNAPSHOT'
     compileOnly 'com.github.spotbugs:spotbugs-annotations:4.9.3'
     implementation 'io.papermc:paperlib:1.0.8'
     spotbugsPlugins 'com.h3xstream.findsecbugs:findsecbugs-plugin:1.14.0'
     testCompileOnly 'com.github.spotbugs:spotbugs-annotations:4.9.3'
-    testImplementation 'io.papermc.paper:paper-api:1.21.6-R0.1-SNAPSHOT'
+    testImplementation 'io.papermc.paper:paper-api:1.26.1-R0.1-SNAPSHOT'
     testImplementation 'org.junit.jupiter:junit-jupiter:5.13.1'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.13.1'
 }
